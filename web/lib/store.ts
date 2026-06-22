@@ -35,7 +35,7 @@
 // Server-only by construction: imports node:fs/promises + node:crypto (used
 // ONLY on the file-fallback path) and @opennextjs/cloudflare, so this module
 // can never be bundled into a client component.
-import { mkdir, readFile, writeFile, rename, readdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -171,6 +171,16 @@ async function fileGet(caseId: string): Promise<Case | null> {
   }
 }
 
+async function fileDelete(caseId: string): Promise<boolean> {
+  const dir = await ensureDir();
+  try {
+    await unlink(caseFilePath(dir, caseId));
+    return true;
+  } catch {
+    return false; // missing
+  }
+}
+
 async function fileList(): Promise<CaseSummary[]> {
   const dir = await ensureDir();
   let entries: string[];
@@ -236,6 +246,14 @@ async function d1Get(db: D1Database, caseId: string): Promise<Case | null> {
   } catch {
     return null; // corrupt / schema-invalid
   }
+}
+
+async function d1Delete(db: D1Database, caseId: string): Promise<boolean> {
+  const row = await db
+    .prepare(`DELETE FROM cases WHERE case_id = ?1 RETURNING case_id`)
+    .bind(caseId)
+    .first<{ case_id: string }>();
+  return row != null;
 }
 
 interface SummaryRow {
@@ -342,6 +360,17 @@ export async function patchCase(
 
   const valid = CaseSchema.parse(merged);
   return saveCase(valid);
+}
+
+/**
+ * Permanently delete a Case by id. Returns true if a Case was removed, false if
+ * none existed. Used by the owner-initiated tenant delete path and Ops retention
+ * (cron purge). Invalid ids return false without touching the store.
+ */
+export async function deleteCase(caseId: string): Promise<boolean> {
+  if (!CASE_ID_RE.test(caseId)) return false;
+  const db = await getDB();
+  return db ? d1Delete(db, caseId) : fileDelete(caseId);
 }
 
 // ---------------------------------------------------------------------------

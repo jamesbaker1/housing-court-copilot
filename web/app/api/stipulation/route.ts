@@ -31,6 +31,8 @@ import { TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
 import { getCase, patchCase } from "@/lib/store";
 import { OPUS } from "@/lib/anthropic";
 import type { Audit, AttorneyReview, Case } from "@/lib/case";
+import { limitPublicApi } from "@/lib/ratelimit";
+import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
 /** Vision + reasoning over the document can take a while; allow a budget. */
@@ -116,11 +118,32 @@ async function attachNote(
 // ---------------------------------------------------------------------------
 
 export async function POST(request: Request): Promise<Response> {
+  // Rate limit (cost-DoS protection).
+  const limit = await limitPublicApi(request, "stipulation");
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Too many requests. Please slow down." },
+      { status: 429 },
+    );
+  }
+
   let body: StipRequestBody;
   try {
     body = (await request.json()) as StipRequestBody;
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
+  }
+
+  // Bot protection. Fails closed in production; open in dev when unconfigured.
+  const turnstile = await verifyTurnstile(
+    extractTurnstileToken(request, body),
+    request.headers.get("cf-connecting-ip"),
+  );
+  if (!turnstile.ok) {
+    return NextResponse.json(
+      { error: "challenge_failed", message: "Please complete the verification and try again." },
+      { status: 403 },
+    );
   }
 
   if (typeof body.base64Data !== "string" || body.base64Data.length === 0) {

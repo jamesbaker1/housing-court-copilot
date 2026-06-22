@@ -81,6 +81,8 @@ export interface BuildingIntelFindings {
 
 export interface BuildingIntelProps {
   caseId: string | null;
+  /** Per-case capability token (Bearer) required by the owner-gated cases route. */
+  caseToken?: string | null;
   findings: BuildingIntelFindings | null;
   /** Current Case evidence[] — used to read/flip the open-data verify gates. */
   evidence?: EvidenceItem[];
@@ -108,11 +110,13 @@ function StatusPill({ children, tone }: { children: React.ReactNode; tone: "dang
 /** A verify control bound to a single open-data evidence item by id. */
 function VerifyControl({
   caseId,
+  caseToken,
   item,
   allEvidence,
   onEvidenceUpdate,
 }: {
   caseId: string | null;
+  caseToken?: string | null;
   item: EvidenceItem | undefined;
   allEvidence: EvidenceItem[];
   onEvidenceUpdate?: (evidence: EvidenceItem[]) => void;
@@ -147,9 +151,13 @@ function VerifyControl({
       };
     });
     try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (caseToken) headers["Authorization"] = `Bearer ${caseToken}`;
       const res = await fetch(`/api/cases/${caseId}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ evidence: updatedEvidence }),
       });
       if (!res.ok) throw new Error(`Save failed (HTTP ${res.status})`);
@@ -186,6 +194,7 @@ function VerifyControl({
 
 export default function BuildingIntel({
   caseId,
+  caseToken,
   findings,
   evidence = [],
   onEvidenceUpdate,
@@ -267,6 +276,7 @@ export default function BuildingIntel({
           <div className="mt-3">
             <VerifyControl
               caseId={caseId}
+              caseToken={caseToken}
               item={registrationItems[0]}
               allEvidence={evidence}
               onEvidenceUpdate={onEvidenceUpdate}
@@ -305,6 +315,7 @@ export default function BuildingIntel({
           <div className="mt-3">
             <VerifyControl
               caseId={caseId}
+              caseToken={caseToken}
               item={ownershipItems[0]}
               allEvidence={evidence}
               onEvidenceUpdate={onEvidenceUpdate}
@@ -366,6 +377,7 @@ export default function BuildingIntel({
                       <div className="mt-2">
                         <VerifyControl
                           caseId={caseId}
+              caseToken={caseToken}
                           item={item}
                           allEvidence={evidence}
                           onEvidenceUpdate={onEvidenceUpdate}

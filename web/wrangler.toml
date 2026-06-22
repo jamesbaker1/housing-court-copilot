@@ -9,7 +9,11 @@
 # step — see DEPLOY-CLOUDFLARE.md and the TODO on database_id below.
 
 name = "housing-court-copilot"
-main = ".open-next/worker.js"
+# Ops-owned wrapper entry: re-exports the OpenNext worker's `fetch` + Durable
+# Objects unchanged and ADDS the `scheduled()` cron handler (PII retention
+# purge). It imports ".open-next/worker.js", so the OpenNext build must run
+# first (the `deploy`/`preview` scripts already do `opennextjs-cloudflare build`).
+main = "worker-entry.ts"
 
 # A recent, valid compatibility date (<= today). nodejs_compat is required by
 # OpenNext so the Worker can run the Next.js server (node:* built-ins, etc.).
@@ -27,9 +31,29 @@ directory = ".open-next/assets"
 [[d1_databases]]
 binding = "DB"
 database_name = "housing-court-copilot"
-# TODO(operator, deploy-time): replace the placeholder below with the real id
-# printed by `wrangler d1 create housing-court-copilot`. Local (miniflare) mode
-# (`--local`) ignores this id, so local dev/preview work as-is. DO NOT run the
-# remote `wrangler d1 create` / `wrangler deploy` here — that needs an account.
-database_id = "00000000-0000-0000-0000-000000000000"
+# Remote D1 created via `wrangler d1 create housing-court-copilot` on the
+# operator's Cloudflare account. Local (miniflare) mode (`--local`) ignores this
+# id; forkers should substitute their own from their `wrangler d1 create`.
+# NOTE: database_id is a non-secret Cloudflare resource id (not a credential).
+database_id = "6a4c1609-d91d-4aa2-9f86-4bd37cade15f"
 migrations_dir = "migrations"
+
+# --- Cron Trigger: PII retention purge (REVIEW fix #5) ---------------------
+# Runs the deterministic retention purge daily at 07:10 UTC (~03:10 ET). The
+# handler (worker-entry.ts `scheduled`) deletes closed/inactive cases past their
+# data_retention_class window, NEVER purges audit.legal_hold cases, and sweeps
+# expired auth/rate-limit rows. Window constants live in lib/retention.ts.
+[triggers]
+crons = ["10 7 * * *"]
+
+# --- Observability ----------------------------------------------------------
+# Workers Logs, so the cron's PII-free purge summary + any D1 errors are
+# visible via `wrangler tail` / the dashboard (REVIEW: no [observability] block).
+[observability]
+enabled = true
+
+# SECRETS (never inline here — set with `wrangler secret put`):
+#   ANTHROPIC_API_KEY, TWILIO_* , CF_ACCESS_* , TURNSTILE_SECRET_KEY,
+#   and CASE_PII_KEY (base64 32-byte AES key for field-level PII encryption;
+#   see lib/crypto-field.ts + DATA-SECURITY.md). NEXT_PUBLIC_TURNSTILE_SITE_KEY
+#   is a public client value and is fine to ship via the build env.

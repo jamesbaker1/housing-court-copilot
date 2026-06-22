@@ -17,7 +17,7 @@
  * stream (one JSON object per line) of events:
  *   { type: "routed", payload: { message, cta, disclaimer } }
  *   { type: "text", delta: string }
- *   { type: "review_update", review, audit_event }   // advisory; ignored here
+ *   { type: "review_update", review, audit_event }   // advisory; server persists, ignored here
  *   { type: "done" }
  *   { type: "error", message: string }
  */
@@ -48,8 +48,6 @@ export interface ChatPanelProps {
   caseObject?: unknown;
   /** Optional starter suggestions shown when the chat is empty. */
   suggestions?: string[];
-  /** Surfaced when the route emits a `review_update` (e.g. advice hard-route). */
-  onReviewUpdate?: (review: unknown) => void;
   className?: string;
 }
 
@@ -75,7 +73,6 @@ export default function ChatPanel({
   caseId,
   caseObject,
   suggestions = DEFAULT_SUGGESTIONS,
-  onReviewUpdate,
   className = "",
 }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -173,7 +170,10 @@ export default function ChatPanel({
           case "error":
             throw new Error(ev.message ?? "stream error");
           case "review_update":
-            if (ev.review != null) onReviewUpdate?.(ev.review);
+            // Advisory only. The /api/chat route is now the SOLE server-side
+            // writer of review.advice_routed + the audit event; the client no
+            // longer PATCHes the review subtree back (it would be an untrusted
+            // writer of a safety signal). We intentionally ignore this frame.
             break;
           case "done":
           default:

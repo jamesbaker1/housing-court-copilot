@@ -45,6 +45,9 @@ web/
     page.tsx       # foundation placeholder home page
   app/
     copilot/page.tsx   # the 7-step tenant flow (entry point for all features)
+    case/page.tsx      # "your case" home — persistent dashboard a tenant returns to
+                       #   (anonymous-first; same-device capability token or optional
+                       #    phone-OTP owner session; bounces a no-case visitor to /copilot)
     provider/          # legal-aid triage console (consent-gated, NO AUTH in v1)
     api/               # intake, chat, defenses, answer, evidence, handoff,
                        #   cases, cases/[id], building, reminders, stipulation,
@@ -149,6 +152,20 @@ Beyond the core 7-step `/copilot` flow, v1 ships:
   (localStorage `hcc_case_id`) and PATCHes confirmed fields, chat review
   updates, open-data evidence, and reminder consent back onto the Case. Every
   read/write re-validates the full Case with `CaseSchema` regardless of backend.
+  The now-gated `/api/cases/[id]` requires proof of ownership: on `POST /api/cases`
+  the server mints a **per-case capability token** returned once and stored
+  client-side (localStorage `hcc_case_token`), sent as `Authorization: Bearer …`
+  on every read/write — so the same browser reads its own case with **no login**.
+  The shared client contract lives in `@/lib/caseClient`.
+- **"Your case" home** (`/case`) — a persistent dashboard a returning tenant lands
+  on: a court-date **countdown shown only once the date is confirmed**, a single
+  next-step CTA, then compact Timeline / Evidence / Documents & packet / Reminders /
+  Free-legal-help sections (each linking back into the matching `/copilot` step).
+  **Anonymous-first**: a brand-new visitor with no stored case is sent straight to
+  `/copilot` (no account, no wall); a same-device returner authenticates with the
+  capability token above; cross-device resume is the optional phone-OTP owner
+  session (`x-owner-session`). The page only reads the Case (plus a best-effort
+  language PATCH) — it never writes a safety-owned field.
 - **Optional "resume on another device"** (reminders step) — a collapsed,
   opt-in `ResumeByPhone` affordance lets a tenant link this case to a verified
   phone via SMS-OTP (`POST /api/auth/otp/request` + `/verify`). It is **never a
@@ -274,10 +291,19 @@ See `.env.example`. Secrets live in env only — never hardcoded, never committe
 | `TWILIO_ACCOUNT_SID` | Optional | SMS reminders | Reminders run in **dry-run** (schedule + log, never send) |
 | `TWILIO_AUTH_TOKEN` | Optional | SMS reminders | as above |
 | `TWILIO_FROM` | Optional | SMS reminders | as above |
-| `HCC_DATA_DIR` | Optional | Case store | Defaults to `<cwd>/.data/cases` |
+| `TURNSTILE_SECRET_KEY` | **Required in production** | Bot protection (server siteverify) on the public routes: intake, chat, defenses, answer, stipulation, OTP request | **Prod: fails CLOSED** — those endpoints return `403`. Dev/test: verification is skipped with a logged warning so `next dev` works without a key. |
+| `NEXT_PUBLIC_TURNSTILE_SITE_KEY` | **Required in production** | The client Turnstile widget (public site key — not a secret; shipped via the build env) | No widget renders, so no token is produced and the prod server rejects with `403`. |
+| `CF_ACCESS_TEAM_DOMAIN` / `CF_ACCESS_AUD` | **Required in production** | Cloudflare Access gate on `/provider` (middleware) | Provider PII surface cannot verify the Access JWT; provider routes are unusable / unguarded depending on edge `NODE_ENV`. |
+| `CASE_PII_KEY` | Optional (recommended in prod) | Field-level PII encryption (base64 32-byte AES key; see `DATA-SECURITY.md`) | PII subset stored without envelope encryption. |
+| `HCC_DATA_DIR` | Optional | Case store (local file fallback only) | Defaults to `<cwd>/.data/cases`. Ignored on Workers (D1 `DB` binding is authoritative). |
 
 NYC GeoSearch (address→BBL) and JustFix Who Owns What are **keyless** — no env
 needed. Live SMS additionally requires an approved A2P 10DLC brand/campaign.
+
+> **Turnstile note:** `TURNSTILE_SECRET_KEY` is a server secret (`wrangler secret put`);
+> `NEXT_PUBLIC_TURNSTILE_SITE_KEY` is the public widget key and is fine to ship in the
+> client bundle. In production both must be set or the public API surface fails closed
+> (`403`). In local dev, leaving the secret unset skips verification (logged warning).
 
 ## House-style notes for module engineers
 

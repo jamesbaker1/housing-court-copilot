@@ -25,6 +25,13 @@ yarn-error.log*
 .env
 .env.local
 .env*.local
+# Wrangler local secrets — NEVER commit (ANTHROPIC/TWILIO/CF_ACCESS/TURNSTILE/CASE_PII_KEY)
+.dev.vars
+.dev.vars.*
+*.dev.vars
+
+# Local data — may contain tenant PII from the file-store fallback
+.data/
 
 # typescript
 *.tsbuildinfo

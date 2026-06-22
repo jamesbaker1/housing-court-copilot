@@ -17,6 +17,8 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { verifyOtp } from "@/lib/auth/otp";
+import { issueOwnerSession } from "@/lib/auth/session";
+import { clientIp, rateLimit, PUBLIC_API_RULE } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
 
@@ -51,6 +53,16 @@ export async function POST(req: Request): Promise<NextResponse> {
     );
   }
 
+  // Rate-limit verify attempts by IP to blunt online code guessing (the
+  // per-phone attempt cap in lib/auth/otp.ts handles the per-code dimension).
+  const limit = await rateLimit(`ip:${clientIp(req)}:otp_verify`, PUBLIC_API_RULE);
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Too many attempts. Please wait and try again." },
+      { status: 429 },
+    );
+  }
+
   const result = await verifyOtp({
     phone_e164: parsed.data.phone_e164,
     code: parsed.data.code,
@@ -60,8 +72,19 @@ export async function POST(req: Request): Promise<NextResponse> {
     return NextResponse.json(GENERIC_FAIL, { status: 400 });
   }
 
+  // Issue an OTP-verified OWNER SESSION so the tenant can access every case this
+  // phone owns from this device (carried as x-owner-session on /api/cases/*).
+  // Null in the file-fallback dev path (no D1 to persist the session hash).
+  const session = await issueOwnerSession(parsed.data.phone_e164);
+
   return NextResponse.json(
-    { ok: true, case_ids: result.case_ids },
+    {
+      ok: true,
+      case_ids: result.case_ids,
+      ...(session
+        ? { owner_session: session.token, session_expires_at: session.expires_at }
+        : {}),
+    },
     { status: 200 },
   );
 }

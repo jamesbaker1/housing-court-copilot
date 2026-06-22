@@ -20,6 +20,9 @@ import {
 } from "@/lib/llm/defenses";
 import { DefenseCodeSchema, type DefenseChecklistItem } from "@/lib/case";
 import { DisclaimerContext, getDisclaimer } from "@/lib/disclaimers";
+import { screenTurn } from "@/lib/llm/advice-classifier";
+import { limitPublicApi } from "@/lib/ratelimit";
+import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
 
@@ -36,9 +39,20 @@ const RequestSchema = z.object({
   candidate_defense_codes: z.array(DefenseCodeSchema).optional(),
   evidence: z.array(EvidenceContextSchema).optional(),
   language: z.string().optional(),
+  /** Cloudflare Turnstile token (bot protection). */
+  turnstileToken: z.string().optional(),
 });
 
 export async function POST(request: Request): Promise<NextResponse> {
+  // Rate limit (cost-DoS protection).
+  const limit = await limitPublicApi(request, "defenses");
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Too many requests. Please slow down." },
+      { status: 429 },
+    );
+  }
+
   let body: unknown;
   try {
     body = await request.json();
@@ -52,6 +66,47 @@ export async function POST(request: Request): Promise<NextResponse> {
       { error: "invalid_request", issues: parsed.error.flatten() },
       { status: 400 },
     );
+  }
+
+  // Bot protection. Fails closed in production; open in dev when unconfigured.
+  const turnstile = await verifyTurnstile(
+    extractTurnstileToken(request, body),
+    request.headers.get("cf-connecting-ip"),
+  );
+  if (!turnstile.ok) {
+    return NextResponse.json(
+      { error: "challenge_failed", message: "Please complete the verification and try again." },
+      { status: 403 },
+    );
+  }
+
+  const disclaimerEarly = getDisclaimer(DisclaimerContext.Defense);
+
+  // Invariant #1: run the fail-closed advice classifier on the RAW narrative
+  // BEFORE the authoring LLM call. A positive suppresses the checklist entirely
+  // and routes to a human. The model's own refusal/route stays a SECONDARY
+  // backstop below.
+  const narrative = parsed.data.narrative;
+  if (narrative && narrative.trim().length > 0) {
+    let screen;
+    try {
+      screen = await screenTurn({
+        turnText: narrative,
+        turnContext: "evidence_narrative",
+        language: parsed.data.language ?? "en",
+      });
+    } catch {
+      screen = { decision: "route_to_human" as const, runs: [], any_positive: true };
+    }
+    if (screen.decision === "route_to_human") {
+      return NextResponse.json({
+        defenses_checklist: [] as DefenseChecklistItem[],
+        route_to_human: true,
+        stop_reason: "advice_screen_route_to_human",
+        model: null,
+        disclaimer: disclaimerEarly,
+      });
+    }
   }
 
   const input: DefenseSpotInput = parsed.data;

@@ -24,12 +24,40 @@ import { NextResponse, type NextRequest } from "next/server";
 import { verifyAccessRequest } from "@/lib/auth/access";
 
 export const config = {
-  // Match the provider page surface and the provider API surface.
-  matcher: ["/provider", "/provider/:path*", "/api/provider/:path*"],
+  // Match the provider page surface and the provider API surface, PLUS the
+  // tenant case surface so we can strip spoofable identity headers inbound.
+  //
+  // NOTE: /api/cases/* is NOT gated by Cloudflare Access (it is tenant-facing,
+  // anonymous-by-default). Its ownership gate lives IN the route handler
+  // (per-case capability token / OTP owner session via lib/auth/session.ts).
+  // Middleware's only job on that surface is the inbound header strip below.
+  matcher: [
+    "/provider",
+    "/provider/:path*",
+    "/api/provider/:path*",
+    "/api/cases/:path*",
+  ],
 };
 
 function isApiPath(pathname: string): boolean {
   return pathname.startsWith("/api/");
+}
+
+function isProviderPath(pathname: string): boolean {
+  return pathname === "/provider" || pathname.startsWith("/provider/") ||
+    pathname.startsWith("/api/provider/");
+}
+
+/**
+ * Delete attacker-supplied identity headers BEFORE any handler reads them. Only
+ * the verified-token path below may set x-access-*; a client must never be able
+ * to inject them. Returns a fresh Headers with the spoofable keys removed.
+ */
+function stripInboundIdentityHeaders(req: NextRequest): Headers {
+  const headers = new Headers(req.headers);
+  headers.delete("x-access-email");
+  headers.delete("x-access-sub");
+  return headers;
 }
 
 function forbiddenResponse(req: NextRequest, reason: string): NextResponse {
@@ -73,30 +101,41 @@ function forbiddenResponse(req: NextRequest, reason: string): NextResponse {
 }
 
 export async function middleware(req: NextRequest): Promise<NextResponse> {
+  const pathname = req.nextUrl.pathname;
+
+  // Always strip spoofable identity headers inbound (latent spoofing footgun).
+  const safeHeaders = stripInboundIdentityHeaders(req);
+
+  // Tenant case surface: NOT Access-gated. The route handler enforces the
+  // per-case ownership gate. Here we only pass the header-stripped request on.
+  if (!isProviderPath(pathname)) {
+    return NextResponse.next({ request: { headers: safeHeaders } });
+  }
+
   const isProd = process.env.NODE_ENV === "production";
   const devBypassDisabled = process.env.CF_ACCESS_DISABLE_DEV === "1";
 
   // DEV BYPASS: allow through in non-production unless explicitly disabled.
   if (!isProd && !devBypassDisabled) {
     console.warn(
-      `DEV: Access bypassed for ${req.method} ${req.nextUrl.pathname} ` +
+      `DEV: Access bypassed for ${req.method} ${pathname} ` +
         `(set CF_ACCESS_DISABLE_DEV=1 to enforce Cloudflare Access locally)`,
     );
-    return NextResponse.next();
+    return NextResponse.next({ request: { headers: safeHeaders } });
   }
 
   const result = await verifyAccessRequest(req);
   if (!result.ok) {
     console.warn(
-      `Access denied for ${req.method} ${req.nextUrl.pathname}: ${result.reason}`,
+      `Access denied for ${req.method} ${pathname}: ${result.reason}`,
     );
     return forbiddenResponse(req, result.reason);
   }
 
   // Authenticated. Forward the provider identity downstream for audit; route
-  // handlers may read `x-access-email` instead of re-verifying the token.
-  const headers = new Headers(req.headers);
-  if (result.email) headers.set("x-access-email", result.email);
-  if (result.sub) headers.set("x-access-sub", result.sub);
-  return NextResponse.next({ request: { headers } });
+  // handlers may read `x-access-email` instead of re-verifying the token. These
+  // are set ONLY from the verified token (the inbound copies were stripped above).
+  if (result.email) safeHeaders.set("x-access-email", result.email);
+  if (result.sub) safeHeaders.set("x-access-sub", result.sub);
+  return NextResponse.next({ request: { headers: safeHeaders } });
 }

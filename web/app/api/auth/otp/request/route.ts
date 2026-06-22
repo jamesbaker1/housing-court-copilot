@@ -15,6 +15,8 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { requestOtp } from "@/lib/auth/otp";
+import { checkOtpSendLimit, clientIp } from "@/lib/ratelimit";
+import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
 
@@ -47,6 +49,28 @@ export async function POST(req: Request): Promise<NextResponse> {
       { error: "invalid_request", details: parsed.error.flatten() },
       { status: 400 },
     );
+  }
+
+  const ip = clientIp(req);
+
+  // Bot protection: a Turnstile token is required before we will send any SMS.
+  // Fails closed in production (open in dev when TURNSTILE_SECRET_KEY is unset).
+  const turnstile = await verifyTurnstile(extractTurnstileToken(req, body), ip);
+  if (!turnstile.ok) {
+    return NextResponse.json(
+      { error: "challenge_failed", message: "Please complete the verification and try again." },
+      { status: 403 },
+    );
+  }
+
+  // SMS toll-fraud / harassment protection: per-phone (3/hr) + per-IP (10/hr) +
+  // a global daily SMS ceiling. On a tripped limit we return the SAME generic OK
+  // as a successful request, so an attacker cannot probe the limiter state or
+  // learn whether the phone is known (anti-enumeration is preserved).
+  const decision = await checkOtpSendLimit(parsed.data.phone_e164, ip);
+  if (!decision.allowed) {
+    console.warn(`OTP send suppressed by rate limit (${decision.reason}).`);
+    return NextResponse.json(GENERIC_OK, { status: 200 });
   }
 
   // Fire and forget the outcome: we never surface it to the client.

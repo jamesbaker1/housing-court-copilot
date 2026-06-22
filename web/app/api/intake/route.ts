@@ -27,6 +27,8 @@ import {
   type IntakeMediaType,
 } from "@/lib/llm/extract";
 import type { Borough, CaseType, Money } from "@/lib/case";
+import { limitPublicApi } from "@/lib/ratelimit";
+import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
 /** Vision + extraction can take a while; allow a generous budget. */
@@ -107,6 +109,16 @@ function buildExplainFacts(
 // ---------------------------------------------------------------------------
 
 export async function POST(request: Request): Promise<Response> {
+  // Rate limit (cost-DoS protection) — vision extraction is the most expensive
+  // public call, so this is the most important endpoint to meter.
+  const limit = await limitPublicApi(request, "intake");
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Too many requests. Please slow down." },
+      { status: 429 },
+    );
+  }
+
   let body: IntakeRequestBody;
   try {
     body = (await request.json()) as IntakeRequestBody;
@@ -114,6 +126,18 @@ export async function POST(request: Request): Promise<Response> {
     return NextResponse.json(
       { error: "Invalid JSON body." },
       { status: 400 },
+    );
+  }
+
+  // Bot protection. Fails closed in production; open in dev when unconfigured.
+  const turnstile = await verifyTurnstile(
+    extractTurnstileToken(request, body),
+    request.headers.get("cf-connecting-ip"),
+  );
+  if (!turnstile.ok) {
+    return NextResponse.json(
+      { error: "challenge_failed", message: "Please complete the verification and try again." },
+      { status: 403 },
     );
   }
 

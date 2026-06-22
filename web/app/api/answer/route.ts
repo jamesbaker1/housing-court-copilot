@@ -25,6 +25,9 @@ import {
   type DraftAnswerInput,
 } from "@/lib/llm/answer-draft";
 import { type FactualStatement } from "@/lib/case";
+import { screenTurn } from "@/lib/llm/advice-classifier";
+import { limitPublicApi } from "@/lib/ratelimit";
+import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
 
@@ -33,6 +36,8 @@ const RequestSchema = z.object({
   language: z.string().optional(),
   /** Tenant-set general-denial flag. NEVER decided by the LLM. */
   general_denial: z.boolean().nullable().optional(),
+  /** Cloudflare Turnstile token (bot protection). */
+  turnstileToken: z.string().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -57,6 +62,15 @@ function ulid(): string {
 }
 
 export async function POST(request: Request): Promise<NextResponse> {
+  // Rate limit (cost-DoS protection).
+  const limit = await limitPublicApi(request, "answer");
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Too many requests. Please slow down." },
+      { status: 429 },
+    );
+  }
+
   let body: unknown;
   try {
     body = await request.json();
@@ -70,6 +84,48 @@ export async function POST(request: Request): Promise<NextResponse> {
       { error: "invalid_request", issues: parsed.error.flatten() },
       { status: 400 },
     );
+  }
+
+  // Bot protection. Fails closed in production; open in dev when unconfigured.
+  const turnstile = await verifyTurnstile(
+    extractTurnstileToken(request, body),
+    request.headers.get("cf-connecting-ip"),
+  );
+  if (!turnstile.ok) {
+    return NextResponse.json(
+      { error: "challenge_failed", message: "Please complete the verification and try again." },
+      { status: 403 },
+    );
+  }
+
+  // Invariant #1: run the fail-closed advice classifier on the RAW free-text
+  // BEFORE the authoring LLM call. A positive suppresses the draft entirely and
+  // routes to a human. The authoring model's self-reported is_advice_request
+  // stays as a SECONDARY backstop below.
+  let screen;
+  try {
+    screen = await screenTurn({
+      turnText: parsed.data.raw_statements,
+      turnContext: "answer_free_text",
+      language: parsed.data.language ?? "en",
+    });
+  } catch {
+    screen = { decision: "route_to_human" as const, runs: [], any_positive: true };
+  }
+  if (screen.decision === "route_to_human") {
+    return NextResponse.json({
+      answer_draft: {
+        general_denial: parsed.data.general_denial ?? null,
+        factual_statements: [] as FactualStatement[],
+        form_fields: [],
+        status: "draft" as const,
+      },
+      advice_requests: [] as string[],
+      route_to_human: true,
+      stop_reason: "advice_screen_route_to_human",
+      model: null,
+      disclaimer: ANSWER_DRAFT_DISCLAIMER,
+    });
   }
 
   const input: DraftAnswerInput = {

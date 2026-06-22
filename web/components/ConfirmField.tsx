@@ -50,6 +50,12 @@ export interface ConfirmFieldProps {
    * string the tenant typed (ISO date for `date`, dollars for `money`).
    */
   onCorrect: (correctedValue: string) => void;
+  /** Localized label for the confirm button (defaults to English). */
+  confirmLabel?: string;
+  /** Localized label for the "no, fix it" button (defaults to English). */
+  correctLabel?: string;
+  /** Localized label for the "enter it" button when unreadable (defaults English). */
+  enterLabel?: string;
   className?: string;
 }
 
@@ -80,6 +86,9 @@ export default function ConfirmField({
   hint,
   onConfirm,
   onCorrect,
+  confirmLabel = "Yes, that's right",
+  correctLabel = "No, fix it",
+  enterLabel = "Enter it",
   className = "",
 }: ConfirmFieldProps) {
   const [mode, setMode] = useState<"prompt" | "correcting">("prompt");
@@ -145,7 +154,7 @@ export default function ConfirmField({
               onClick={onConfirm}
               className="rounded-md bg-trust-600 px-4 py-2 text-sm font-semibold text-white hover:bg-trust-700 focus:outline-none focus:ring-2 focus:ring-trust-400"
             >
-              Yes, that&apos;s right
+              {confirmLabel}
             </button>
           )}
           <button
@@ -156,7 +165,7 @@ export default function ConfirmField({
             }}
             className="rounded-md border border-trust-400 bg-white px-4 py-2 text-sm font-semibold text-trust-800 hover:bg-trust-50 focus:outline-none focus:ring-2 focus:ring-trust-400"
           >
-            {unreadable ? "Enter it" : "No, fix it"}
+            {unreadable ? enterLabel : correctLabel}
           </button>
         </div>
       )}

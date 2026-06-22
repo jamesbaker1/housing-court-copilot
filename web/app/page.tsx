@@ -75,16 +75,19 @@ export default function HomePage() {
         </ol>
       </section>
 
-      {/* Language hint — multilingual audience. */}
+      {/* Language hint — multilingual audience. The copilot has a language
+          selector (top of the page) that the assistant honors; some of the
+          fixed page text is still English while we finish translating. */}
       <section
         className="rounded-lg border border-trust-200 bg-trust-50 px-3 py-2 text-sm text-trust-800"
         aria-label="Language options"
       >
         <p>
           <span aria-hidden="true">🌐 </span>
-          <strong>Otros idiomas / 其他語言 / Lòt lang:</strong> You can use this
-          in your language. Tell the copilot which language you prefer, or change
-          it any time.
+          <strong>Español / 繁體中文 / Русский / Kreyòl / বাংলা / 한국어 / العربية:</strong>{" "}
+          When you start, you can pick your language at the top of the page. The
+          assistant will answer in that language. Some buttons and labels are
+          still being translated.
         </p>
       </section>
 

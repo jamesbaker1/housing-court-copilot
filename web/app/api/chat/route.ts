@@ -35,6 +35,9 @@ import {
   type LightGrounding,
 } from "@/lib/llm/copilot";
 import type { MessageParam } from "@/lib/anthropic";
+import { getCase, patchCase } from "@/lib/store";
+import { limitPublicApi } from "@/lib/ratelimit";
+import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -52,14 +55,29 @@ interface ChatRequestBody {
   turnContext?: TurnContext;
   /** The full Case Object, for grounding + the advice-routed mutation. Optional. */
   caseObject?: unknown;
+  /**
+   * The persisted case_id. When present, the SERVER loads the authoritative Case
+   * and persists the advice-routed review subtree + audit event itself (the
+   * single-writer invariant); the client never has to PATCH it back.
+   */
+  caseId?: unknown;
+  /** Cloudflare Turnstile token (bot protection). */
+  turnstileToken?: unknown;
 }
 
 // ---------------------------------------------------------------------------
 // Outbound content scanner (GUARDRAILS-SPEC §2.5) — minimal, defense-in-depth.
 //
-// Deterministic net over LLM-authored text. For the BORDERLINE path it runs
-// before anything is surfaced; any flag re-routes to a human. This is a backstop
-// for the system-prompt firewall, not the primary control. The canonical
+// Deterministic net over LLM-authored text. It now runs over ALL copilot output
+// (both the borderline buffered path AND the normal "proceed" path), so a
+// confidently-misclassified turn that nonetheless elicits a forbidden
+// construction is caught and re-routed before it reaches the tenant. Any flag
+// re-routes to a human and nothing substantive is surfaced.
+//
+// LANGUAGE SCOPE: this regex net is ENGLISH-ONLY. It is a backstop, not the
+// primary control. The MULTILINGUAL control is the system-prompt firewall in the
+// copilot (which is instructed to never author advice in any language); this
+// scanner only adds a deterministic English safety net on top. The canonical
 // scanner is owned by the firewall module; this inline copy covers the §2.1
 // constructions relevant to chat so this endpoint is safe on its own.
 // ---------------------------------------------------------------------------
@@ -99,10 +117,11 @@ type ChatEvent =
   | { type: "done" }
   | {
       /**
-       * Instructs the client/persistence layer to apply a review mutation. The
-       * route handler is the conversational advice router (the SOLE writer of
-       * advice_routed); we emit the computed subtree + audit event rather than
-       * persisting directly, since persistence is owned elsewhere.
+       * Advisory UI hint ONLY. The route handler is the conversational advice
+       * router (the SOLE writer of advice_routed) and now PERSISTS the review
+       * subtree + audit event server-side (see persistAdviceRouted). We still
+       * emit this event so the client can update its local view, but durability
+       * + integrity no longer ride on a client PATCH.
        */
       type: "review_update";
       review: unknown;
@@ -112,6 +131,54 @@ type ChatEvent =
 
 function enc(ev: ChatEvent): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(ev) + "\n");
+}
+
+/**
+ * Persist the advice-routed transition SERVER-SIDE (single-writer invariant #4).
+ * Loads the AUTHORITATIVE Case by id, computes the review subtree + audit event
+ * with applyAdviceRouted, and writes both via patchCase. Returns the computed
+ * subtree (for the advisory UI event) or null when there is no schema-valid
+ * persisted Case to write against. Best-effort: a persist failure never breaks
+ * the tenant-facing fail-closed response (the model is already suppressed).
+ */
+async function persistAdviceRouted(
+  caseId: string | null,
+  runs: Parameters<typeof applyAdviceRouted>[0]["runs"],
+): Promise<{ review: unknown; audit_event: unknown } | null> {
+  if (!caseId) return null;
+  try {
+    const current = await getCase(caseId);
+    if (!current) return null;
+    const { review, audit_event } = applyAdviceRouted({ caseObject: current, runs });
+    const audit = {
+      ...current.audit,
+      events: [...(current.audit.events ?? []), audit_event],
+    };
+    await patchCase(caseId, { review, audit });
+    return { review, audit_event };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist the detection-log-only update server-side for a cleared turn (logs the
+ * classifier run without setting advice_routed). Best-effort.
+ */
+async function persistDetectionLog(
+  caseId: string | null,
+  runs: Parameters<typeof appendDetectionLog>[0]["runs"],
+): Promise<unknown | null> {
+  if (!caseId) return null;
+  try {
+    const current = await getCase(caseId);
+    if (!current) return null;
+    const review = appendDetectionLog({ caseObject: current, runs });
+    await patchCase(caseId, { review });
+    return review;
+  } catch {
+    return null;
+  }
 }
 
 function ndjsonResponse(stream: ReadableStream<Uint8Array>): Response {
@@ -129,11 +196,32 @@ function ndjsonResponse(stream: ReadableStream<Uint8Array>): Response {
 // ---------------------------------------------------------------------------
 
 export async function POST(req: NextRequest): Promise<Response> {
+  // Rate limit (cost-DoS protection) — cheap, before any LLM work or body parse.
+  const limit = await limitPublicApi(req, "chat");
+  if (!limit.allowed) {
+    return Response.json(
+      { error: "rate_limited", message: "Too many requests. Please slow down." },
+      { status: 429 },
+    );
+  }
+
   let body: ChatRequestBody;
   try {
     body = (await req.json()) as ChatRequestBody;
   } catch {
     return Response.json({ error: "invalid JSON body" }, { status: 400 });
+  }
+
+  // Bot protection. Fails closed in production; open in dev when unconfigured.
+  const turnstile = await verifyTurnstile(
+    extractTurnstileToken(req, body),
+    req.headers.get("cf-connecting-ip"),
+  );
+  if (!turnstile.ok) {
+    return Response.json(
+      { error: "challenge_failed", message: "Please complete the verification and try again." },
+      { status: 403 },
+    );
   }
 
   const message = typeof body.message === "string" ? body.message : "";
@@ -143,18 +231,21 @@ export async function POST(req: NextRequest): Promise<Response> {
 
   const turnContext: TurnContext = body.turnContext ?? "chat";
   const history = Array.isArray(body.history) ? body.history : [];
+  const caseId =
+    typeof body.caseId === "string" && /^case_[0-9a-hjkmnp-tv-z]{26}$/.test(body.caseId)
+      ? body.caseId
+      : null;
 
-  // Parse the case if provided. A malformed case is non-fatal: we fall back to
-  // an ungrounded copilot, but we cannot then apply the review mutation, so on a
-  // routed turn we still emit the non-advice response (fail closed on safety).
-  //
-  // v1: the intake route is stateless, so the chat client sends tenant-CONFIRMED
-  // fields (a LightGrounding) rather than a schema-valid Case. We accept that as
-  // copilot grounding while still requiring a full Case to compute the review
-  // mutation (the safety-critical write path stays strict).
+  // Resolve the case for grounding. We prefer the AUTHORITATIVE persisted Case
+  // (loaded server-side by caseId) over the client-supplied caseObject, since the
+  // server is the single writer of the safety-critical review subtree. The client
+  // caseObject (or a LightGrounding) is a fallback for grounding only.
   let caseObject: Case | null = null;
   let lightGrounding: LightGrounding | null = null;
-  if (body.caseObject != null) {
+  if (caseId) {
+    caseObject = await getCase(caseId);
+  }
+  if (caseObject == null && body.caseObject != null) {
     const parsed = CaseSchema.safeParse(body.caseObject);
     if (parsed.success) {
       caseObject = parsed.data;
@@ -187,17 +278,20 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   // 2. Hard-route path: suppress the model, surface the fixed non-advice response.
+  //    The SERVER persists advice_routed + the audit event (single-writer #4).
   if (route.decision === "route_to_human") {
+    const persisted = await persistAdviceRouted(caseId, route.runs);
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(enc({ type: "routed", payload: buildNonAdviceResponse() }));
-        // Emit the review mutation when we have a case to compute it against.
-        if (caseObject != null) {
-          const { review, audit_event } = applyAdviceRouted({
-            caseObject,
-            runs: route.runs,
-          });
-          controller.enqueue(enc({ type: "review_update", review, audit_event }));
+        if (persisted != null) {
+          controller.enqueue(
+            enc({
+              type: "review_update",
+              review: persisted.review,
+              audit_event: persisted.audit_event,
+            }),
+          );
         }
         controller.enqueue(enc({ type: "done" }));
         controller.close();
@@ -206,60 +300,49 @@ export async function POST(req: NextRequest): Promise<Response> {
     return ndjsonResponse(stream);
   }
 
-  // 3. Allowed to proceed. Log the classifier run(s) without setting advice_routed.
-  const reviewLogUpdate =
-    caseObject != null
-      ? appendDetectionLog({ caseObject, runs: route.runs })
-      : null;
-
-  const borderline = route.decision === "proceed_borderline";
-
+  // Both `proceed` and `proceed_borderline` now take the same path: the copilot
+  // output is buffered, scanned, and only then surfaced (§2.5 applied to ALL
+  // output, not just borderline). The borderline distinction no longer changes
+  // surfacing — the deterministic English scanner runs uniformly.
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
         const sdkStream = streamCopilot({ messages, caseObject, lightGrounding });
 
-        if (borderline) {
-          // §1.4 step 3 + §2.5: buffer, scan, then surface (or re-route).
-          const final = await sdkStream.finalMessage();
-          const text = final.content
-            .map((b) => (b.type === "text" ? b.text : ""))
-            .join("");
+        // §2.5: buffer + scan ALL copilot output (not just borderline) before
+        // surfacing. A confidently-misclassified turn that elicits a forbidden
+        // construction is caught here and re-routed to a human, server-side.
+        const final = await sdkStream.finalMessage();
+        const text = final.content
+          .map((b) => (b.type === "text" ? b.text : ""))
+          .join("");
 
-          const flagged = scanOutbound(text);
-          if (flagged) {
-            // Re-route to human; do NOT surface the substantive output.
-            controller.enqueue(enc({ type: "routed", payload: buildNonAdviceResponse() }));
-            if (caseObject != null) {
-              const { review, audit_event } = applyAdviceRouted({
-                caseObject,
-                runs: route.runs,
-              });
-              controller.enqueue(enc({ type: "review_update", review, audit_event }));
-            }
-            controller.enqueue(enc({ type: "done" }));
-            controller.close();
-            return;
-          }
-
-          // Clean: surface the buffered text as one delta, then the detection log.
-          controller.enqueue(enc({ type: "text", delta: text }));
-          if (reviewLogUpdate != null) {
-            controller.enqueue(enc({ type: "review_update", review: reviewLogUpdate }));
+        const flagged = scanOutbound(text);
+        if (flagged) {
+          // Re-route to human; do NOT surface the substantive output. Persist
+          // the advice-routed transition server-side (single-writer #4).
+          const persisted = await persistAdviceRouted(caseId, route.runs);
+          controller.enqueue(enc({ type: "routed", payload: buildNonAdviceResponse() }));
+          if (persisted != null) {
+            controller.enqueue(
+              enc({
+                type: "review_update",
+                review: persisted.review,
+                audit_event: persisted.audit_event,
+              }),
+            );
           }
           controller.enqueue(enc({ type: "done" }));
           controller.close();
           return;
         }
 
-        // Normal cleared path: stream deltas live.
-        sdkStream.on("text", (delta: string) => {
-          controller.enqueue(enc({ type: "text", delta }));
-        });
-        await sdkStream.finalMessage();
-
-        if (reviewLogUpdate != null) {
-          controller.enqueue(enc({ type: "review_update", review: reviewLogUpdate }));
+        // Clean: surface the buffered text, then persist the detection-log-only
+        // update server-side (logs the classifier run; advice_routed stays false).
+        controller.enqueue(enc({ type: "text", delta: text }));
+        const reviewLog = await persistDetectionLog(caseId, route.runs);
+        if (reviewLog != null) {
+          controller.enqueue(enc({ type: "review_update", review: reviewLog }));
         }
         controller.enqueue(enc({ type: "done" }));
         controller.close();

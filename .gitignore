@@ -13,7 +13,9 @@ web/.data/
 .env
 .env.local
 .env*.local
+# Wrangler local secrets — NEVER commit (ANTHROPIC/TWILIO/CF_ACCESS/TURNSTILE/CASE_PII_KEY)
 .dev.vars
+.dev.vars.*
 *.dev.vars
 
 # OS / editor

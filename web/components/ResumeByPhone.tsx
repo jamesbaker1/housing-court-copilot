@@ -19,11 +19,19 @@
 
 import { useState } from "react";
 
+import Turnstile from "@/components/Turnstile";
+
 export interface ResumeByPhoneProps {
   /** The case currently being worked on; linked to the phone on success. */
   caseId: string;
   /** Called with the phone's owned case_ids after a successful verification. */
   onLinked?: (caseIds: string[]) => void;
+  /**
+   * Called with the OTP-verified owner session token (+ expiry) on success. The
+   * page can present it as `x-owner-session` to the owner-gated cases route from
+   * a device that doesn't hold the per-case capability token.
+   */
+  onSession?: (session: { token: string; expires_at?: string }) => void;
   className?: string;
 }
 
@@ -32,6 +40,7 @@ type Step = "idle" | "code";
 export default function ResumeByPhone({
   caseId,
   onLinked,
+  onSession,
   className = "",
 }: ResumeByPhoneProps) {
   const [open, setOpen] = useState(false);
@@ -42,6 +51,8 @@ export default function ResumeByPhone({
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  // Bot protection for the public OTP-request action (sends an SMS).
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
 
   function normalizePhone(raw: string): string {
     // Best-effort E.164: strip spaces/dashes/parens; default a bare 10-digit US
@@ -67,7 +78,11 @@ export default function ResumeByPhone({
       const res = await fetch("/api/auth/otp/request", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone_e164, case_id: caseId }),
+        body: JSON.stringify({
+          phone_e164,
+          case_id: caseId,
+          ...(turnstileToken ? { turnstileToken } : {}),
+        }),
       });
       const data = (await res.json().catch(() => ({}))) as { message?: string };
       if (!res.ok) {
@@ -83,6 +98,8 @@ export default function ResumeByPhone({
     } catch {
       setError("Network error. Please try again.");
     } finally {
+      // The Turnstile token is single-use; force a re-solve before another send.
+      setTurnstileToken(null);
       setBusy(false);
     }
   }
@@ -104,6 +121,8 @@ export default function ResumeByPhone({
       });
       const data = (await res.json().catch(() => ({}))) as {
         case_ids?: string[];
+        owner_session?: string;
+        session_expires_at?: string;
       };
       if (!res.ok) {
         setError("That code didn't work. Request a new one and try again.");
@@ -112,6 +131,12 @@ export default function ResumeByPhone({
       setDone(true);
       setNotice("Saved. You can resume this case from your phone anytime.");
       onLinked?.(Array.isArray(data.case_ids) ? data.case_ids : [caseId]);
+      if (data.owner_session) {
+        onSession?.({
+          token: data.owner_session,
+          ...(data.session_expires_at ? { expires_at: data.session_expires_at } : {}),
+        });
+      }
     } catch {
       setError("Network error. Please try again.");
     } finally {
@@ -193,9 +218,12 @@ export default function ResumeByPhone({
               disabled={busy}
             />
           </label>
+          {/* Bot protection before we send any SMS. Dev shows a no-op placeholder
+              and emits a sentinel token so local dev still works. */}
+          <Turnstile onToken={setTurnstileToken} action="otp_request" />
           <button
             type="submit"
-            disabled={busy}
+            disabled={busy || turnstileToken == null}
             className="rounded bg-trust-900 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
           >
             {busy ? "Sending…" : "Send me a code"}

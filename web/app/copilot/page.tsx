@@ -45,10 +45,29 @@ import ChatPanel from "@/components/ChatPanel";
 import BuildingIntel, { type BuildingIntelFindings } from "@/components/BuildingIntel";
 import StipReview from "@/components/StipReview";
 import ResumeByPhone from "@/components/ResumeByPhone";
+import Turnstile from "@/components/Turnstile";
 import { DisclaimerContext, TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
 import type { Case, CaseType, ConfidenceLevel, EvidenceItem } from "@/lib/case";
+import {
+  type Language,
+  DEFAULT_LANGUAGE,
+  SUPPORTED_LANGUAGES,
+  LANGUAGE_ENDONYMS,
+  coerceLanguage,
+  getStrings,
+  isFullyTranslated,
+  isRtl,
+} from "@/lib/i18n";
+// Same-device auth contract (per-case capability token in localStorage,
+// presented as Authorization: Bearer on every gated /api/cases call). Shared
+// with the persistent /case dashboard via lib/caseClient so the two surfaces
+// stay consistent. See lib/auth/session.ts.
+import {
+  CASE_ID_STORAGE_KEY,
+  CASE_TOKEN_STORAGE_KEY,
+  LANGUAGE_STORAGE_KEY,
+} from "@/lib/caseClient";
 
-const CASE_ID_STORAGE_KEY = "hcc_case_id";
 
 // ---------------------------------------------------------------------------
 // Wire shapes (projections of the real route responses).
@@ -91,12 +110,43 @@ interface AnswerResponse {
 interface UiField {
   key: string;
   label: string;
+  /** Human-readable rendering shown on screen (e.g. "Monday, June 30, 2026"). */
   displayValue: string;
+  /**
+   * The RAW, machine-shaped value (ISO date "YYYY-MM-DD", dollar string, borough
+   * slug, etc.) used to build the Case patch. The court-date persistence bug
+   * (REVIEW fix #4) was passing `displayValue` to fieldToCasePatch, which only
+   * accepts ISO — the long-form display string failed the round-trip and the
+   * patch was silently dropped. We keep the raw value here and patch with it.
+   */
+  rawValue: string;
   confidence: ConfidenceLevel;
   critical?: boolean;
   inputType?: "date" | "text" | "money";
   hint?: string;
   confirmed?: boolean;
+}
+
+/**
+ * Coerce an extracted field value into the RAW string shape fieldToCasePatch
+ * expects (ISO date, a plain number/string for money, the borough slug, etc.).
+ * This is the value that PERSISTS; renderValue() is for display only.
+ */
+function rawValueOf(key: string, raw: unknown): string {
+  if (raw == null) return "";
+  if (typeof raw === "object") {
+    const obj = raw as Record<string, unknown>;
+    // Money: keep dollars as a plain numeric string (toCents parses it).
+    if (typeof obj.amount_cents === "number") {
+      return (obj.amount_cents / 100).toString();
+    }
+    if (typeof obj.amount === "number") return obj.amount.toString();
+    // Address object → line1 (the patch only records line1 today).
+    if (typeof obj.line1 === "string") return obj.line1;
+    return "";
+  }
+  // Strings (ISO dates, names, borough slugs, index numbers) pass through raw.
+  return typeof raw === "string" ? raw : String(raw);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +228,20 @@ function renderValue(key: string, raw: unknown): string {
         });
       }
     }
+    // Money fields whose raw value is a plain numeric string ("1234.56") render
+    // as currency (the rawValue we persist for money is a dollar number string).
+    if (
+      (key === "claimed_arrears" || key === "monthly_rent") &&
+      /^\d+(\.\d+)?$/.test(raw.trim())
+    ) {
+      const n = Number.parseFloat(raw);
+      if (!Number.isNaN(n)) {
+        return `$${n.toLocaleString(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })}`;
+      }
+    }
     if (key === "borough") {
       return raw.charAt(0).toUpperCase() + raw.slice(1).replace(/_/g, " ");
     }
@@ -197,6 +261,7 @@ function mapFields(map: ExtractedFieldsMap | undefined): UiField[] {
       key,
       label: meta.label,
       displayValue: renderValue(key, entry.value),
+      rawValue: rawValueOf(key, entry.value),
       confidence: entry.confidence ?? "unreadable",
       critical: meta.critical,
       inputType: meta.inputType,
@@ -305,10 +370,28 @@ export default function CopilotPage() {
   const [sessionId] = useState(newSessionId);
   // The real persisted case_id (mints on mount). Falls back to sessionId until set.
   const [caseId, setCaseId] = useState<string | null>(null);
+  // The per-case capability token presented on every cases-route call.
+  const [caseToken, setCaseToken] = useState<string | null>(null);
   // The last-known persisted Case — passed to chat as schema-valid grounding.
   const [persistedCase, setPersistedCase] = useState<Case | null>(null);
   const caseIdRef = useRef<string | null>(null);
   caseIdRef.current = caseId;
+  const caseTokenRef = useRef<string | null>(null);
+  caseTokenRef.current = caseToken;
+  // An OTP-verified owner session token (from resume-by-phone), used as an auth
+  // fallback to the cases route when the per-case capability token isn't held.
+  const ownerSessionRef = useRef<string | null>(null);
+
+  // Tenant-chosen language. Persisted onto the Case and threaded into every LLM
+  // call (intake/chat/defenses/answer) so a limited-English tenant gets output
+  // in their language. Defaults to a stored choice or English.
+  const [language, setLanguage] = useState<Language>(DEFAULT_LANGUAGE);
+  const languageRef = useRef<Language>(language);
+  languageRef.current = language;
+  const t = getStrings(language);
+
+  // Turnstile tokens for the two public entry points (single-use; null until solved).
+  const [intakeTurnstile, setIntakeTurnstile] = useState<string | null>(null);
 
   const [intake, setIntake] = useState<IntakeResponse | null>(null);
   const [fields, setFields] = useState<UiField[]>([]);
@@ -348,28 +431,50 @@ export default function CopilotPage() {
   const courtDateField = fields.find((f) => f.key === "court_date");
   // Evidence currently on the persisted Case (drives the open-data verify gates).
   const evidence: EvidenceItem[] = persistedCase?.evidence ?? [];
+  // The upload action is enabled once Turnstile has produced a token (in dev the
+  // widget emits a sentinel immediately, so this is true right away locally).
+  const intakeReady = intakeTurnstile != null;
 
   // ----- Persistence: mint or rehydrate a Case on mount --------------------
 
   useEffect(() => {
     let cancelled = false;
 
+    // Restore a previously chosen language (the Case is the source of truth once
+    // loaded, but this avoids a flash of English for a returning tenant).
+    try {
+      const storedLang = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+      if (storedLang) setLanguage(coerceLanguage(storedLang));
+    } catch {
+      /* ignore */
+    }
+
     async function init() {
       let existing: string | null = null;
+      let existingToken: string | null = null;
       try {
         existing = window.localStorage.getItem(CASE_ID_STORAGE_KEY);
+        existingToken = window.localStorage.getItem(CASE_TOKEN_STORAGE_KEY);
       } catch {
         existing = null;
       }
 
       if (existing) {
         try {
-          const res = await fetch(`/api/cases/${existing}`);
+          // Present the capability token; the route is owner-gated now.
+          const res = await fetch(
+            `/api/cases/${existing}`,
+            existingToken
+              ? { headers: { Authorization: `Bearer ${existingToken}` } }
+              : undefined,
+          );
           if (res.ok) {
             const data = (await res.json()) as { case?: Case };
             if (!cancelled && data.case) {
               setCaseId(data.case.case_id);
+              if (existingToken) setCaseToken(existingToken);
               setPersistedCase(data.case);
+              if (data.case.language) setLanguage(coerceLanguage(data.case.language));
               const rehydrated = caseToUiFields(data.case);
               if (rehydrated.length > 0) {
                 setFields(rehydrated);
@@ -382,7 +487,7 @@ export default function CopilotPage() {
               return;
             }
           }
-          // Stored id is stale/missing on the server — fall through to create.
+          // Stored id is stale/forbidden on the server — fall through to create.
         } catch {
           // Network error — fall through to create a fresh case.
         }
@@ -392,15 +497,26 @@ export default function CopilotPage() {
         const res = await fetch("/api/cases", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ language: "en" }),
+          body: JSON.stringify({ language: languageRef.current }),
         });
         if (res.ok) {
-          const data = (await res.json()) as { case_id: string; case: Case };
+          const data = (await res.json()) as {
+            case_id: string;
+            case: Case;
+            case_token?: string | null;
+          };
           if (!cancelled) {
             setCaseId(data.case_id);
             setPersistedCase(data.case);
+            if (data.case.language) setLanguage(coerceLanguage(data.case.language));
             try {
               window.localStorage.setItem(CASE_ID_STORAGE_KEY, data.case_id);
+              if (data.case_token) {
+                setCaseToken(data.case_token);
+                window.localStorage.setItem(CASE_TOKEN_STORAGE_KEY, data.case_token);
+              } else {
+                window.localStorage.removeItem(CASE_TOKEN_STORAGE_KEY);
+              }
             } catch {
               /* ignore storage failures */
             }
@@ -417,6 +533,18 @@ export default function CopilotPage() {
     };
   }, []);
 
+  // Headers for any /api/cases/[id] call: JSON + the capability token (Bearer),
+  // and/or an OTP-verified owner session (x-owner-session) as a fallback.
+  function caseAuthHeaders(json = true): Record<string, string> {
+    const h: Record<string, string> = {};
+    if (json) h["Content-Type"] = "application/json";
+    const tok = caseTokenRef.current;
+    if (tok) h["Authorization"] = `Bearer ${tok}`;
+    const sess = ownerSessionRef.current;
+    if (sess) h["x-owner-session"] = sess;
+    return h;
+  }
+
   // Fire-and-forget PATCH that records the latest Case subtree(s) server-side.
   function persistPatch(patch: Partial<Case>) {
     const id = caseIdRef.current;
@@ -425,7 +553,7 @@ export default function CopilotPage() {
       try {
         const res = await fetch(`/api/cases/${id}`, {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
+          headers: caseAuthHeaders(),
           body: JSON.stringify(patch),
         });
         if (res.ok) {
@@ -440,8 +568,21 @@ export default function CopilotPage() {
     })();
   }
 
+  // Change the UI language AND persist it onto the Case so every server-side LLM
+  // call (chat/answer/defenses/explanation) is grounded to the chosen language.
+  function changeLanguage(next: Language) {
+    setLanguage(next);
+    try {
+      window.localStorage.setItem(LANGUAGE_STORAGE_KEY, next);
+    } catch {
+      /* ignore */
+    }
+    if (caseIdRef.current) persistPatch({ language: next } as Partial<Case>);
+  }
+
   // The chat route grounds on a schema-valid Case; pass the persisted Case when
-  // we have one (this is what enables the advice_routed review mutation).
+  // we have one. The SERVER is the sole writer of review.advice_routed now (the
+  // chat route persists it), so the client no longer PATCHes it back.
   const caseObject = persistedCase;
 
   // ----- Step 1: upload / photo -> /api/intake -----------------------------
@@ -450,11 +591,7 @@ export default function CopilotPage() {
     setError(null);
     const mediaType = file.type;
     if (!SUPPORTED_MEDIA.has(mediaType)) {
-      setError(
-        "That file type isn't supported. Please use a JPEG or PNG photo, or a " +
-          "PDF. (If your phone saved a HEIC photo, try taking a screenshot of it " +
-          "first.)",
-      );
+      setError(t.unsupportedFile);
       return;
     }
     setIntakeBusy(true);
@@ -463,7 +600,12 @@ export default function CopilotPage() {
       const res = await fetch("/api/intake", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base64Data, mediaType }),
+        body: JSON.stringify({
+          base64Data,
+          mediaType,
+          language: languageRef.current,
+          ...(intakeTurnstile ? { turnstileToken: intakeTurnstile } : {}),
+        }),
       });
       if (!res.ok) throw new Error(`Intake failed (${res.status}).`);
       const data = (await res.json()) as IntakeResponse;
@@ -471,11 +613,10 @@ export default function CopilotPage() {
       setFields(mapFields(data.extractedFields));
       setStep(2);
     } catch {
-      setError(
-        "We couldn't read that file. Try a clearer photo, or a PDF, and make " +
-          "sure the whole page is visible.",
-      );
+      setError(t.couldNotReadFile);
     } finally {
+      // A Turnstile token is single-use; force a re-solve before the next upload.
+      setIntakeTurnstile(null);
       setIntakeBusy(false);
     }
   }
@@ -483,16 +624,23 @@ export default function CopilotPage() {
   // ----- Step 2: confirm/correct fields (client-side human gate) -----------
 
   function confirmField(key: string, correctedValue?: string) {
-    let confirmedDisplay = "";
+    // The RAW value is what persists. On confirm-as-read we use the field's raw
+    // value (ISO date, dollar string, slug); on correct we use exactly what the
+    // tenant typed (ConfirmField hands back the raw input, e.g. an ISO date from
+    // the <input type="date">). renderValue() is used ONLY for the on-screen
+    // string. (REVIEW fix #4: passing the long-form display string here dropped
+    // the patch because toIsoDate failed the round-trip.)
+    const corrected =
+      correctedValue != null && correctedValue !== "" ? correctedValue : null;
+    let rawForPatch = corrected ?? "";
+
     setFields((prev) =>
       prev.map((f) => {
         if (f.key !== key) return f;
-        const displayValue =
-          correctedValue != null && correctedValue !== ""
-            ? renderValue(key, correctedValue)
-            : f.displayValue;
-        confirmedDisplay = displayValue;
-        return { ...f, confirmed: true, displayValue };
+        const rawValue = corrected ?? f.rawValue;
+        rawForPatch = rawValue;
+        const displayValue = renderValue(key, rawValue);
+        return { ...f, confirmed: true, rawValue, displayValue };
       }),
     );
 
@@ -500,7 +648,7 @@ export default function CopilotPage() {
     // Pass the current Case so subtree patches (court/parties/property) merge
     // with already-confirmed fields rather than clobbering them (the store
     // replaces whole sub-objects, so we pre-merge here).
-    const patch = fieldToCasePatch(key, confirmedDisplay, persistedCase);
+    const patch = fieldToCasePatch(key, rawForPatch, persistedCase);
     if (patch) persistPatch(patch);
   }
 
@@ -515,7 +663,7 @@ export default function CopilotPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          language: "en",
+          language: languageRef.current,
           narrative: fields
             .filter((f) => f.confirmed)
             .map((f) => `${f.label}: ${f.displayValue}`)
@@ -545,7 +693,7 @@ export default function CopilotPage() {
       const res = await fetch("/api/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ raw_statements: raw, language: "en" }),
+        body: JSON.stringify({ raw_statements: raw, language: languageRef.current }),
       });
       if (!res.ok) throw new Error();
       const data = (await res.json()) as AnswerResponse;
@@ -693,17 +841,36 @@ export default function CopilotPage() {
   }
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-5" dir={isRtl(language) ? "rtl" : "ltr"} lang={language}>
       <StepHeader step={step} />
 
-      <div className="flex justify-end">
-        <Link
-          href="/provider"
-          className="text-xs text-trust-600 underline underline-offset-2 hover:text-trust-800"
-        >
-          Legal-aid provider view →
-        </Link>
+      <div className="flex items-center justify-between gap-2">
+        <LanguageSelector
+          value={language}
+          onChange={changeLanguage}
+          label={t.languageLabel}
+        />
+        <div className="flex items-center gap-3">
+          <Link
+            href="/case"
+            className="text-xs text-trust-700 underline underline-offset-2 hover:text-trust-900"
+          >
+            Your case home →
+          </Link>
+          <Link
+            href="/provider"
+            className="text-xs text-trust-600 underline underline-offset-2 hover:text-trust-800"
+          >
+            Legal-aid provider view →
+          </Link>
+        </div>
       </div>
+
+      {!isFullyTranslated(language) && (
+        <p className="rounded-md bg-trust-50 px-3 py-2 text-xs text-trust-700">
+          {t.partialTranslationNote}
+        </p>
+      )}
 
       {error && (
         <p
@@ -718,14 +885,14 @@ export default function CopilotPage() {
         <div className="hcc-deadline flex items-center justify-between gap-2 rounded-lg">
           <p className="text-sm">
             <span aria-hidden="true">📅 </span>
-            <strong>Your court date:</strong> {courtDateField.displayValue}
+            <strong>{t.yourCourtDate}</strong> {courtDateField.displayValue}
           </p>
           <button
             type="button"
             onClick={() => setStep(2)}
             className="shrink-0 text-xs font-medium text-trust-700 underline underline-offset-2"
           >
-            Check again
+            {t.checkAgain}
           </button>
         </div>
       )}
@@ -733,23 +900,27 @@ export default function CopilotPage() {
       {/* ---------------- Step 1: Upload ---------------- */}
       {step === 1 && (
         <section className="space-y-4">
-          <p className="text-trust-800">
-            Take a clear photo of your court papers, or upload a photo or PDF you
-            already have. We&apos;ll read it and show you what it says.
-          </p>
+          <p className="text-trust-800">{t.uploadIntro}</p>
 
           <div className="space-y-3">
-            <label className="block w-full cursor-pointer rounded-xl bg-trust-600 px-6 py-5 text-center text-lg font-semibold text-white hover:bg-trust-700 focus-within:ring-2 focus-within:ring-trust-400">
+            <label
+              className={[
+                "block w-full rounded-xl bg-trust-600 px-6 py-5 text-center text-lg font-semibold text-white focus-within:ring-2 focus-within:ring-trust-400",
+                intakeBusy || !intakeReady
+                  ? "cursor-not-allowed opacity-60"
+                  : "cursor-pointer hover:bg-trust-700",
+              ].join(" ")}
+            >
               <span aria-hidden="true" className="mr-2 text-2xl">
                 📷
               </span>
-              {intakeBusy ? "Reading your papers…" : "Take a photo"}
+              {intakeBusy ? t.readingPapers : t.takePhoto}
               <input
                 type="file"
                 accept="image/*"
                 capture="environment"
                 className="sr-only"
-                disabled={intakeBusy}
+                disabled={intakeBusy || !intakeReady}
                 onChange={(e) => {
                   const f = e.target.files?.[0];
                   if (f) void onFile(f);
@@ -757,16 +928,23 @@ export default function CopilotPage() {
               />
             </label>
 
-            <label className="block w-full cursor-pointer rounded-xl border border-trust-400 bg-white px-6 py-4 text-center text-base font-semibold text-trust-800 hover:bg-trust-50 focus-within:ring-2 focus-within:ring-trust-400">
+            <label
+              className={[
+                "block w-full rounded-xl border border-trust-400 bg-white px-6 py-4 text-center text-base font-semibold text-trust-800 focus-within:ring-2 focus-within:ring-trust-400",
+                intakeBusy || !intakeReady
+                  ? "cursor-not-allowed opacity-60"
+                  : "cursor-pointer hover:bg-trust-50",
+              ].join(" ")}
+            >
               <span aria-hidden="true" className="mr-2">
                 📄
               </span>
-              Upload a photo or PDF
+              {t.uploadFile}
               <input
                 type="file"
                 accept="image/*,application/pdf"
                 className="sr-only"
-                disabled={intakeBusy}
+                disabled={intakeBusy || !intakeReady}
                 onChange={(e) => {
                   const f = e.target.files?.[0];
                   if (f) void onFile(f);
@@ -775,9 +953,13 @@ export default function CopilotPage() {
             </label>
           </div>
 
+          {/* Bot protection for the public intake action. Dev renders a no-op
+              placeholder and emits a sentinel token so local dev still works. */}
+          <Turnstile onToken={setIntakeTurnstile} action="intake" />
+
           {intakeBusy && (
             <p className="text-center text-sm text-trust-700" aria-live="polite">
-              Reading your papers… this can take a few seconds.
+              {t.readingPapersHint}
             </p>
           )}
 
@@ -788,11 +970,7 @@ export default function CopilotPage() {
       {/* ---------------- Step 2: Confirm fields ---------------- */}
       {step === 2 && (
         <section className="space-y-4">
-          <p className="text-trust-800">
-            Here&apos;s what we read from your papers. Please check each one
-            against your official documents. Fix anything that&apos;s wrong — you
-            know your case best.
-          </p>
+          <p className="text-trust-800">{t.confirmIntro}</p>
 
           {fields.length === 0 && (
             <div className="hcc-verify rounded-lg">
@@ -821,6 +999,9 @@ export default function CopilotPage() {
               hint={courtDateField.hint}
               onConfirm={() => confirmField("court_date")}
               onCorrect={(v) => confirmField("court_date", v)}
+              confirmLabel={t.yesThatsRight}
+              correctLabel={t.noFixIt}
+              enterLabel={t.enterIt}
             />
           )}
 
@@ -837,6 +1018,9 @@ export default function CopilotPage() {
                 hint={f.hint}
                 onConfirm={() => confirmField(f.key)}
                 onCorrect={(v) => confirmField(f.key, v)}
+                confirmLabel={t.yesThatsRight}
+                correctLabel={t.noFixIt}
+                enterLabel={t.enterIt}
               />
             ))}
 
@@ -844,14 +1028,12 @@ export default function CopilotPage() {
 
           <NavButtons
             onBack={() => setStep(1)}
-            backLabel="Start over"
+            backLabel={t.startOver}
             onNext={() => goTo(3)}
-            nextLabel="Looks right — continue"
+            nextLabel={t.continueLabel}
             nextDisabled={!courtDateField?.confirmed}
             nextHint={
-              !courtDateField?.confirmed
-                ? "Please confirm your court date before continuing — it's the most important date."
-                : undefined
+              !courtDateField?.confirmed ? t.confirmCourtDateFirst : undefined
             }
           />
         </section>
@@ -932,6 +1114,7 @@ export default function CopilotPage() {
             {buildingOpen && (
               <BuildingIntel
                 caseId={caseId}
+                caseToken={caseToken}
                 findings={buildingFindings}
                 evidence={evidence}
                 onEvidenceUpdate={(next) =>
@@ -955,11 +1138,11 @@ export default function CopilotPage() {
       {step === 4 && (
         <section className="space-y-4">
           <h2 className="text-lg">Ask anything about how this works</h2>
-          <ChatPanel
-            caseId={caseId ?? sessionId}
-            caseObject={caseObject}
-            onReviewUpdate={(review) => persistPatch({ review } as Partial<Case>)}
-          />
+          {/* The chat route is now the SOLE server-side writer of
+              review.advice_routed + the audit event (REVIEW fix #3). The client
+              no longer PATCHes the review subtree back — it would be an untrusted
+              writer of a safety signal. */}
+          <ChatPanel caseId={caseId ?? sessionId} caseObject={caseObject} />
 
           {kbSources.length > 0 && (
             <div className="rounded-lg border border-trust-200 bg-trust-50 px-4 py-3">
@@ -1308,6 +1491,11 @@ export default function CopilotPage() {
               onLinked={() => {
                 window.localStorage.setItem(CASE_ID_STORAGE_KEY, caseId);
               }}
+              onSession={({ token }) => {
+                // Hold the owner session so cases-route calls authorize from a
+                // device that doesn't carry the per-case capability token.
+                ownerSessionRef.current = token;
+              }}
             />
           )}
 
@@ -1344,6 +1532,36 @@ function humanizeDefense(code: string): string {
   return code
     .replace(/_/g, " ")
     .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** Compact language picker. Persists the choice onto the Case via the parent. */
+function LanguageSelector({
+  value,
+  onChange,
+  label,
+}: {
+  value: Language;
+  onChange: (lang: Language) => void;
+  label: string;
+}) {
+  return (
+    <label className="inline-flex items-center gap-1.5 text-xs text-trust-700">
+      <span aria-hidden="true">🌐</span>
+      <span className="sr-only">{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value as Language)}
+        aria-label={label}
+        className="rounded-md border border-trust-300 bg-white px-2 py-1 text-xs text-trust-900 focus:border-trust-500 focus:outline-none focus:ring-2 focus:ring-trust-400"
+      >
+        {SUPPORTED_LANGUAGES.map((lang) => (
+          <option key={lang} value={lang}>
+            {LANGUAGE_ENDONYMS[lang]}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
 }
 
 /**
@@ -1414,6 +1632,7 @@ function caseToUiFields(c: Case): UiField[] {
       key,
       label: meta.label,
       displayValue: renderValue(key, raw),
+      rawValue: rawValueOf(key, raw),
       confidence: "high",
       critical: meta.critical,
       inputType: meta.inputType,

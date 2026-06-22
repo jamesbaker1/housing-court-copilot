@@ -486,20 +486,42 @@ export type OpenDataAssertion = z.infer<typeof OpenDataAssertionSchema>;
  * Court coordinates. The authoritative court_date is DET-sourced (eTrack /
  * NYSCEF) and is verified ONLY when so sourced — never trusted from the model.
  */
-export const CourtSchema = z.object({
-  county: CountySchema.nullable().optional(),
-  borough: BoroughSchema.nullable().optional(),
-  index_number: z.string().nullable().optional(),
-  /** DET authoritative court date. The LLM-extracted value lives on the document. */
-  court_date: DateSchema.nullable().optional(),
-  court_date_source: z
-    .enum(["etrack", "nyscef", "document_extracted_unverified", "tenant_entered"])
-    .nullable()
-    .optional(),
-  /** True ONLY when sourced from eTrack/NYSCEF — never from a document extraction. */
-  court_date_verified: z.boolean().default(false),
-  part: z.string().nullable().optional(),
-});
+export const CourtSchema = z
+  .object({
+    county: CountySchema.nullable().optional(),
+    borough: BoroughSchema.nullable().optional(),
+    index_number: z.string().nullable().optional(),
+    /** DET authoritative court date. The LLM-extracted value lives on the document. */
+    court_date: DateSchema.nullable().optional(),
+    court_date_source: z
+      .enum(["etrack", "nyscef", "document_extracted_unverified", "tenant_entered"])
+      .nullable()
+      .optional(),
+    /** True ONLY when sourced from eTrack/NYSCEF — never from a document extraction. */
+    court_date_verified: z.boolean().default(false),
+    part: z.string().nullable().optional(),
+  })
+  // Invariant #2 at the SCHEMA boundary: a verified court date is verified ONLY
+  // when its source is an authoritative court system (eTrack / NYSCEF). A const
+  // enum rejects a WRONG source value, but not a client supplying the valid
+  // literal `verified=true` alongside any/no source — this cross-field refine
+  // closes that gap. Any persist of a Case (incl. an unauthenticated PATCH that
+  // somehow reaches the store) that sets verified=true without an authoritative
+  // source is rejected by CaseSchema.parse.
+  .superRefine((c, ctx) => {
+    if (
+      c.court_date_verified === true &&
+      c.court_date_source !== "etrack" &&
+      c.court_date_source !== "nyscef"
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["court_date_verified"],
+        message:
+          "court_date_verified may be true only when court_date_source is 'etrack' or 'nyscef'.",
+      });
+    }
+  });
 export type Court = z.infer<typeof CourtSchema>;
 
 export const LandlordPartySchema = z.object({
@@ -873,3 +895,104 @@ export type Case = z.infer<typeof CaseSchema>;
 
 /** The current schema version this build of the Case Object targets. */
 export const CASE_SCHEMA_VERSION = "1.0.0" as const;
+
+// ---------------------------------------------------------------------------
+// Boundary: strip SAFETY-OWNED fields from a tenant-supplied PATCH.
+//
+// The deterministic engine is the SOLE writer of the four safety invariants.
+// At the API boundary a tenant PATCH must never set any of these (a const enum
+// rejects a WRONG value, but a client can still supply a VALID literal verbatim
+// — e.g. `court_date_verified=true` with `court_date_source="etrack"`). We
+// remove these keys from the incoming patch BEFORE merge, so the persisted
+// value can only ever come from server-side deterministic code that loads the
+// authoritative Case and writes the whole subtree itself.
+//
+// Stripped (per REVIEW fix #1):
+//   - court.court_date_verified, court.court_date_source
+//   - review.advice_routed, review.advice_detection_log
+//   - deadlines[].computed_by
+//   - eligibility.{rtc,legal_aid,rental_assistance}.determined_by
+//   - eligibility.rental_assistance_programs[].determined_by
+//   - answer_draft.form_fields[].placed_by
+// ---------------------------------------------------------------------------
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Return a deep copy of `patch` with all SAFETY-OWNED fields removed. Pure: does
+ * not mutate the input. Unknown keys pass through untouched (CaseSchema still
+ * validates the merged result downstream).
+ */
+export function stripSafetyOwnedFields(
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  // Shallow clone the top level; we only need to deep-touch the safety subtrees.
+  const out: Record<string, unknown> = { ...patch };
+
+  // court.* — never let a client claim a verified/authoritative court date.
+  if (isPlainObject(out.court)) {
+    const court = { ...out.court };
+    delete court.court_date_verified;
+    delete court.court_date_source;
+    out.court = court;
+  }
+
+  // review.* — advice routing + detection log are written only server-side.
+  if (isPlainObject(out.review)) {
+    const review = { ...out.review };
+    delete review.advice_routed;
+    delete review.advice_detection_log;
+    out.review = review;
+  }
+
+  // deadlines[].computed_by — the deterministic-clock provenance.
+  if (Array.isArray(out.deadlines)) {
+    out.deadlines = out.deadlines.map((d) => {
+      if (!isPlainObject(d)) return d;
+      const copy = { ...d };
+      delete copy.computed_by;
+      return copy;
+    });
+  }
+
+  // eligibility.*.determined_by — eligibility is never an LLM/client conclusion.
+  if (isPlainObject(out.eligibility)) {
+    const elig = { ...out.eligibility };
+    for (const key of ["rtc", "legal_aid", "rental_assistance"] as const) {
+      if (isPlainObject(elig[key])) {
+        const result = { ...(elig[key] as Record<string, unknown>) };
+        delete result.determined_by;
+        elig[key] = result;
+      }
+    }
+    if (Array.isArray(elig.rental_assistance_programs)) {
+      elig.rental_assistance_programs = elig.rental_assistance_programs.map(
+        (r) => {
+          if (!isPlainObject(r)) return r;
+          const copy = { ...r };
+          delete copy.determined_by;
+          return copy;
+        },
+      );
+    }
+    out.eligibility = elig;
+  }
+
+  // answer_draft.form_fields[].placed_by — DET placement provenance.
+  if (isPlainObject(out.answer_draft)) {
+    const ad = { ...out.answer_draft };
+    if (Array.isArray(ad.form_fields)) {
+      ad.form_fields = ad.form_fields.map((f) => {
+        if (!isPlainObject(f)) return f;
+        const copy = { ...f };
+        delete copy.placed_by;
+        return copy;
+      });
+    }
+    out.answer_draft = ad;
+  }
+
+  return out;
+}
