@@ -1,0 +1,47 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-trust-50 text-trust-950 antialiased;
+    min-height: 100dvh;
+  }
+
+  /* Comfortable default reading width for long-form legal info on mobile. */
+  h1 {
+    @apply text-2xl font-semibold tracking-tight text-trust-900;
+  }
+  h2 {
+    @apply text-xl font-semibold text-trust-900;
+  }
+  a {
+    @apply text-trust-700 underline underline-offset-2;
+  }
+}
+
+@layer components {
+  /* The persistent "guide, not a lawyer" banner. A trust feature, not chrome. */
+  .hcc-banner {
+    @apply sticky top-0 z-40 w-full border-b border-trust-200 bg-trust-100/95 px-4 py-2 text-sm text-trust-800 backdrop-blur;
+  }
+
+  /* Contextual "verify this / not legal advice" panel for LLM output. */
+  .hcc-verify {
+    @apply rounded-lg border border-verify-300 bg-verify-50 px-3 py-2 text-sm text-verify-900;
+  }
+
+  /* The code-backed court-date / deadline backstop callout. */
+  .hcc-deadline {
+    @apply rounded-lg border border-deadline-200 bg-deadline-50 px-3 py-2 text-sm text-deadline-900;
+  }
+}

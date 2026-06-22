@@ -1,0 +1,35 @@
+# Cloudflare Workers config for the Housing Court Copilot (Next.js 15 via
+# @opennextjs/cloudflare). The build emits .open-next/worker.js + assets; this
+# file tells Wrangler how to run/deploy them and wires the D1 binding the store
+# uses in production.
+#
+# LOCAL DEV / PREVIEW need NO Cloudflare account: D1 has a local (miniflare)
+# mode. Apply migrations locally with `npm run db:migrate:local`. The REMOTE
+# pieces (creating the real D1 database, deploying the Worker) are the operator's
+# step — see DEPLOY-CLOUDFLARE.md and the TODO on database_id below.
+
+name = "housing-court-copilot"
+main = ".open-next/worker.js"
+
+# A recent, valid compatibility date (<= today). nodejs_compat is required by
+# OpenNext so the Worker can run the Next.js server (node:* built-ins, etc.).
+compatibility_date = "2026-06-20"
+compatibility_flags = ["nodejs_compat"]
+
+# Static assets emitted by the OpenNext build.
+[assets]
+binding = "ASSETS"
+directory = ".open-next/assets"
+
+# Cloudflare D1 — the production Case store. The store (lib/store.ts) reads this
+# binding via getCloudflareContext().env.DB; with no binding it falls back to the
+# local file store. `database_name` is what `npm run db:migrate:local` targets.
+[[d1_databases]]
+binding = "DB"
+database_name = "housing-court-copilot"
+# TODO(operator, deploy-time): replace the placeholder below with the real id
+# printed by `wrangler d1 create housing-court-copilot`. Local (miniflare) mode
+# (`--local`) ignores this id, so local dev/preview work as-is. DO NOT run the
+# remote `wrangler d1 create` / `wrangler deploy` here — that needs an account.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
