@@ -46,6 +46,66 @@ migrations_dir = "migrations"
 [triggers]
 crons = ["10 7 * * *"]
 
+# --- Email: inbound eTrack reminder ingest (ROADMAP Tier-2 #6) --------------
+# The Worker's `email()` handler (worker-entry.ts) ingests NY Courts eTrack
+# APPOINTMENT-REMINDER emails — a SANCTIONED channel. We do NOT scrape the live
+# eCourts / eTrack web portal (UCS ToS prohibits bots; CAPTCHA/Cloudflare-walled).
+#
+# OPERATOR MUST CONFIGURE (Cloudflare dashboard — NOT expressible fully in this
+# file; inbound Email Routing has no toml binding):
+#   1) Enable Email Routing on a domain you control in this Cloudflare account.
+#   2) Create a ROUTE ADDRESS (e.g. etrack-ingest@yourdomain) whose action is
+#      "Send to a Worker" -> this Worker ("housing-court-copilot").
+#   3) Have the tenant/operator REGISTER the case in NY Courts eTrack and set the
+#      eTrack notification email to that route address (or auto-forward eTrack
+#      reminders to it). eTrack then emails reminders here on its own.
+#   4) Confirm the eTrack adapter's allowed sender domain(s)
+#      (lib/court-source/adapters/etrack-email ETRACK_SENDER_DOMAINS) match the
+#      real eTrack sender; the handler rejects mail from any other sender.
+#
+# Optional OUTBOUND binding: only needed if a future flow must SEND/forward email
+# (e.g. bounce notices). Inbound ingest does NOT require it. Left commented so we
+# do not bind a sender the deployment hasn't provisioned. Uncomment + set a
+# verified destination address to enable:
+# [[send_email]]
+# name = "EMAIL_SENDER"
+# # destination_address must be a verified Email Routing destination on the account.
+# # destination_address = "ops@yourdomain"
+
+# Ops/attorney gate (NON-SECRET): treat the configured court-data VENDOR feed as
+# AUTHORITATIVE (allowed to set court_date_verified=true) on THIS deployment?
+# Default-deny. Whether a vendor counts as authoritative is an ops/attorney
+# decision, gated here + in lib/court-date.isVendorTreatedAsAuthoritative. eTrack
+# and NYSCEF are authoritative regardless of this flag. The vendor API KEY itself
+# is a SECRET (set via `wrangler secret put`, see the SECRETS note below) — only
+# the trust flag lives here.
+[vars]
+COURT_DATA_VENDOR_AUTHORITATIVE = "false"
+
+# --- Court-date SOURCING channel config (ROADMAP Tier-2 #6) -----------------
+# All default-OFF so the connector is inert until an operator opts a channel in.
+# Each adapter self-gates on these; an unset channel returns not-found.
+#
+# NYSCEF public-docket adapter (DISABLED unless BOTH are set). Never scrapes the
+# interactive UCS portal — COURT_SOURCE_NYSCEF_ENDPOINT must be a SANCTIONED data
+# path (vendor proxy / documented open-data export / UCS data agreement).
+#   COURT_SOURCE_NYSCEF_ENABLED  = "false"
+#   COURT_SOURCE_NYSCEF_ENDPOINT = ""        # e.g. "https://sanctioned.example/nyscef?index={index}"
+#   COURT_SOURCE_NYSCEF_USER_AGENT = "HousingCourtCopilot/1.0 (ops@yourdomain)"
+#
+# Court-data VENDOR adapter (DISABLED unless URL + KEY are set). The KEY is a
+# SECRET (`wrangler secret put COURT_DATA_VENDOR_KEY`); only the non-secret URL +
+# the trust flag (COURT_DATA_VENDOR_AUTHORITATIVE above) live as vars.
+#   COURT_DATA_VENDOR_URL = ""               # e.g. "https://api.vendor.example"
+#
+# PUBLIC (client-exposed, non-secret) inbound eTrack ingest address shown to the
+# tenant in the register-in-eTrack affordance (components/RegisterInEtrack). Set
+# this to the Cloudflare Email Routing address that forwards to this Worker so the
+# UI can tell tenants where to point eTrack reminders. Unset => the UI shows
+# registration guidance without a forwarding address (safe pre-launch default).
+# NEXT_PUBLIC_* is build-time public by Next.js convention.
+#   NEXT_PUBLIC_ETRACK_INGEST_ADDRESS = "etrack-ingest@yourdomain"
+
 # --- Observability ----------------------------------------------------------
 # Workers Logs, so the cron's PII-free purge summary + any D1 errors are
 # visible via `wrangler tail` / the dashboard (REVIEW: no [observability] block).
@@ -57,3 +117,6 @@ enabled = true
 #   and CASE_PII_KEY (base64 32-byte AES key for field-level PII encryption;
 #   see lib/crypto-field.ts + DATA-SECURITY.md). NEXT_PUBLIC_TURNSTILE_SITE_KEY
 #   is a public client value and is fine to ship via the build env.
+#   COURT_DATA_VENDOR_API_KEY — IF a court-data vendor is configured (the
+#   connector's vendor adapter, Adapters phase). The non-secret TRUST flag is the
+#   [vars] COURT_DATA_VENDOR_AUTHORITATIVE above; the key itself is a secret here.

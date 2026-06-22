@@ -494,25 +494,44 @@ export const CourtSchema = z
     /** DET authoritative court date. The LLM-extracted value lives on the document. */
     court_date: DateSchema.nullable().optional(),
     court_date_source: z
-      .enum(["etrack", "nyscef", "document_extracted_unverified", "tenant_entered"])
+      .enum([
+        "etrack",
+        "nyscef",
+        // OPS/ATTORNEY DECISION (config-gated): a configured court-data
+        // VENDOR/partner API. Whether a given vendor's feed is treated as
+        // AUTHORITATIVE (i.e. allowed to set court_date_verified=true) is an
+        // operator/attorney call, NOT a schema fact — it is gated at runtime by
+        // lib/court-date.AUTHORITATIVE_COURT_DATE_SOURCES + connector config.
+        // The enum simply makes the provenance value expressible.
+        "court_data_vendor",
+        "document_extracted_unverified",
+        "tenant_entered",
+      ])
       .nullable()
       .optional(),
-    /** True ONLY when sourced from eTrack/NYSCEF — never from a document extraction. */
+    /** True ONLY when sourced from an AUTHORITATIVE source (eTrack/NYSCEF, and — if the operator/attorney so configures — a court-data vendor). Never from a document extraction. */
     court_date_verified: z.boolean().default(false),
     part: z.string().nullable().optional(),
   })
   // Invariant #2 at the SCHEMA boundary: a verified court date is verified ONLY
-  // when its source is an authoritative court system (eTrack / NYSCEF). A const
-  // enum rejects a WRONG source value, but not a client supplying the valid
-  // literal `verified=true` alongside any/no source — this cross-field refine
-  // closes that gap. Any persist of a Case (incl. an unauthenticated PATCH that
-  // somehow reaches the store) that sets verified=true without an authoritative
-  // source is rejected by CaseSchema.parse.
+  // when its source is an authoritative court system (eTrack / NYSCEF) or a
+  // court-data vendor the operator has chosen to trust. A const enum rejects a
+  // WRONG source value, but not a client supplying the valid literal
+  // `verified=true` alongside any/no source — this cross-field refine closes
+  // that gap. Any persist of a Case (incl. an unauthenticated PATCH that somehow
+  // reaches the store) that sets verified=true without one of these authoritative
+  // sources is rejected by CaseSchema.parse.
+  //
+  // NOTE: the schema permits court_data_vendor here, but whether that vendor is
+  // ACTUALLY treated as authoritative at write time is gated separately by
+  // lib/court-date.AUTHORITATIVE_COURT_DATE_SOURCES + connector config (an
+  // ops/attorney decision). The schema is the floor, not the policy.
   .superRefine((c, ctx) => {
     if (
       c.court_date_verified === true &&
       c.court_date_source !== "etrack" &&
-      c.court_date_source !== "nyscef"
+      c.court_date_source !== "nyscef" &&
+      c.court_date_source !== "court_data_vendor"
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

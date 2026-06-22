@@ -46,6 +46,7 @@ import BuildingIntel, { type BuildingIntelFindings } from "@/components/Building
 import StipReview from "@/components/StipReview";
 import ResumeByPhone from "@/components/ResumeByPhone";
 import Turnstile from "@/components/Turnstile";
+import RegisterInEtrack from "@/components/RegisterInEtrack";
 import { DisclaimerContext, TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
 import type { Case, CaseType, ConfidenceLevel, EvidenceItem } from "@/lib/case";
 import {
@@ -1002,6 +1003,16 @@ export default function CopilotPage() {
               confirmLabel={t.yesThatsRight}
               correctLabel={t.noFixIt}
               enterLabel={t.enterIt}
+            />
+          )}
+
+          {/* eTrack registration affordance — the sanctioned, tenant-driven path
+              to a court-VERIFIED date. A tenant-entered date is never
+              authoritative; eTrack's official reminder email is. Purely
+              informational (no scraping, no stored credentials). */}
+          {courtDateField && (
+            <RegisterInEtrack
+              verified={persistedCase?.court?.court_date_verified === true}
             />
           )}
 

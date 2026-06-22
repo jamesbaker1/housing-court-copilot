@@ -58,7 +58,16 @@ and are the only things left to go live.
   `DB` binding (with a **placeholder `database_id`** you replace in step 2).
 - `open-next.config.ts`, `next.config.mjs` (`initOpenNextCloudflareForDev()`).
 - D1 migrations: `migrations/0001_init.sql` (cases) + `migrations/0002_auth.sql`
-  (tenant_phones / case_owners / otp_codes). **Applied to a LOCAL D1 and smoke-tested.**
+  (tenant_phones / case_owners / otp_codes) + `migrations/0003_security.sql` +
+  `migrations/0004_court_source.sql` (optional `court_index_map` acceleration table
+  for court-date sourcing — additive, safe to leave unused). **Applied to a LOCAL
+  D1 and smoke-tested.**
+- Court-date sourcing (ROADMAP Tier-2 #6): connector + 3 adapters wired in priority
+  order (eTrack-email > NYSCEF > vendor), the Worker `email()` eTrack-ingest handler,
+  and the in-app register-in-eTrack affordance. **eTrack is live-capable once you do
+  the Email Routing setup (step 8 below); NYSCEF + vendor are scaffolded and stay off
+  until you supply a sanctioned endpoint / vendor contract.** Full runbook:
+  `web/docs/COURT-DATE-SOURCING.md`.
 - `/provider` Cloudflare Access gate (`middleware.ts` + `lib/auth/access.ts`, jose JWT verify).
 - Optional SMS-OTP tenant resume (`lib/auth/otp.ts`, `app/api/auth/otp/*`,
   `components/ResumeByPhone.tsx`, wired into `app/copilot/page.tsx`).
@@ -86,7 +95,9 @@ and are the only things left to go live.
    ```bash
    wrangler d1 migrations apply housing-court-copilot --remote
    ```
-   This runs `0001_init.sql` then `0002_auth.sql` on the real database.
+   This runs `0001_init.sql` → `0002_auth.sql` → `0003_security.sql` →
+   `0004_court_source.sql` on the real database (the last is the optional, additive
+   court-date-sourcing acceleration table).
 
 4. **Set secrets** (these are prompted; values never go in the repo). `ANTHROPIC_API_KEY`
    is required; the rest are optional per feature:
@@ -122,7 +133,29 @@ and are the only things left to go live.
    via Access), and confirm a case round-trips in the remote D1
    (`wrangler d1 execute housing-court-copilot --remote --command "SELECT case_id, status FROM cases LIMIT 5;"`).
 
-> **Which is which:** steps 1–7 above are **yours** (account-gated). Everything in
+8. **(Optional) Enable court-date sourcing (ROADMAP Tier-2 #6).** Full runbook +
+   compliance boundary: `web/docs/COURT-DATE-SOURCING.md`. Summary:
+   - **eTrack email (live-capable):** Dashboard → your domain → **Email Routing**:
+     enable it, create a route address (e.g. `etrack-ingest@yourdomain`) with action
+     **"Send to a Worker" → `housing-court-copilot`**. Set
+     `NEXT_PUBLIC_ETRACK_INGEST_ADDRESS` in `wrangler.toml [vars]` so the in-app
+     "register in eTrack" affordance shows it. Confirm `ETRACK_SENDER_DOMAINS`
+     (`lib/court-source/adapters/etrack-email.ts`) matches the real eTrack sender.
+     Tenants add their case in eTrack by index # and point notifications at that
+     address; eTrack then emails reminders the Worker ingests.
+   - **NYSCEF (off by default):** only enable with a **sanctioned** data endpoint —
+     never the interactive portal. Set `COURT_SOURCE_NYSCEF_ENABLED="true"` +
+     `COURT_SOURCE_NYSCEF_ENDPOINT` + `COURT_SOURCE_NYSCEF_USER_AGENT`.
+   - **Vendor (off by default):** set `COURT_DATA_VENDOR_URL`,
+     `wrangler secret put COURT_DATA_VENDOR_KEY`, and fit
+     `lib/court-source/adapters/vendor.ts` to the vendor contract. Keep
+     `COURT_DATA_VENDOR_AUTHORITATIVE="false"` until an attorney signs off on the
+     vendor's accuracy SLA.
+   - **DO NOT** scrape the live UCS eCourts / WebCivilLocal / eTrack web portals
+     (ToS prohibits bots; CAPTCHA/Cloudflare-walled). Only the three sanctioned
+     channels above.
+
+> **Which is which:** steps 1–8 above are **yours** (account-gated). Everything in
 > "Already done" is complete and was verified using D1's **local (miniflare) mode** —
 > no Cloudflare account, no remote calls, no `wrangler deploy`.
 

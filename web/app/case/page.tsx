@@ -340,6 +340,29 @@ export default function CaseHomePage() {
         </Link>
       </section>
 
+      {/* ---------------- Court-date discrepancy / escalation ---------------- */}
+      {/* When a court source (eTrack/NYSCEF/vendor) reports a date that DISAGREES
+          with the tenant-entered date, the connector escalates for human review
+          and NEVER overwrites. Surface that honestly so the tenant knows their
+          date is in question and a person is looking. We do not show the
+          conflicting dates here (the official notice is the source of truth). */}
+      {reviewState === "escalated" && !courtDateAuthoritative && courtDate && (
+        <section className="hcc-deadline space-y-1 rounded-lg text-sm" aria-label="Court date needs review">
+          <p className="font-semibold">
+            <span aria-hidden="true">⚠️ </span>
+            We need to double-check your court date
+          </p>
+          <p>
+            The court system shows a different date than the one on file, so we
+            flagged it for a person to review. Until it&apos;s sorted out, trust
+            your official court notice — do not rely on the date shown above.
+          </p>
+          <p>
+            <TalkToAPersonLink />
+          </p>
+        </section>
+      )}
+
       {/* ---------------- Handoff / advice routing status ---------------- */}
       {adviceRouted && (
         <section className="hcc-deadline space-y-1 rounded-lg text-sm">

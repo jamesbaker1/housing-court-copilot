@@ -30,11 +30,48 @@ import { CourtSchema, DateSchema } from "@/lib/case";
  */
 export type CourtDateSource = NonNullable<Court["court_date_source"]>;
 
-/** The two — and only two — sources that make a court date authoritative. */
+/**
+ * The sources that make a court date authoritative (i.e. set
+ * `court_date_verified = true`).
+ *
+ * eTrack + NYSCEF are authoritative by definition (the court system itself).
+ *
+ * `court_data_vendor` is included because a configured court-data partner API
+ * CAN be authoritative — but WHETHER a given vendor counts is an OPS/ATTORNEY
+ * DECISION, not a code fact. It is therefore gated behind runtime config: a
+ * vendor-sourced date is only verified when the operator has explicitly enabled
+ * it (see {@link isVendorTreatedAsAuthoritative}). Leaving the literal here keeps
+ * the verified invariant in ONE place; the connector must not bypass the gate.
+ */
 export const AUTHORITATIVE_COURT_DATE_SOURCES = [
   "etrack",
   "nyscef",
+  "court_data_vendor",
 ] as const satisfies readonly CourtDateSource[];
+
+/**
+ * Ops/attorney config gate: is the configured court-data VENDOR trusted as an
+ * AUTHORITATIVE source on THIS deployment? Default-deny. The operator opts in by
+ * setting COURT_DATA_VENDOR_AUTHORITATIVE="true" (alongside provisioning the
+ * vendor API key). When false, a vendor hit is still useful as a cross-check but
+ * is NOT allowed to flip court_date_verified — the connector downgrades it.
+ *
+ * This is a deliberately small, side-effect-free policy hook so the invariant
+ * (only authoritative sources verify) stays auditable in one module.
+ */
+export function isVendorTreatedAsAuthoritative(
+  config?: { vendorAuthoritative?: boolean | null },
+): boolean {
+  if (config && typeof config.vendorAuthoritative === "boolean") {
+    return config.vendorAuthoritative;
+  }
+  // Fall back to env when no explicit config is threaded in (Workers/Node).
+  const raw =
+    typeof process !== "undefined"
+      ? process.env?.COURT_DATA_VENDOR_AUTHORITATIVE
+      : undefined;
+  return raw === "true" || raw === "1";
+}
 
 /** Type guard: is this an authoritative (court-sourced) provenance? */
 export function isAuthoritativeSource(
