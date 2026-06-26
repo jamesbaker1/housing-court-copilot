@@ -66,9 +66,47 @@ export type ModelName = typeof OPUS | typeof HAIKU | typeof SONNET;
  */
 let _client: Anthropic | null = null;
 
+/** Optional transport overrides (Cloudflare AI Gateway routing). */
+export interface AnthropicTransportConfig {
+  baseURL?: string;
+  defaultHeaders?: Record<string, string>;
+}
+
+/**
+ * Resolve optional Cloudflare AI Gateway routing from env. When configured,
+ * Anthropic calls route through the gateway for response caching, per-gateway
+ * spend caps + rate limits, automatic fallback, and spend/latency observability
+ * — complementing the app-level `checkLlmGlobalLimit` ceiling. Unconfigured →
+ * direct to api.anthropic.com (a pure no-op).
+ *
+ * Either set `ANTHROPIC_GATEWAY_BASE_URL` to a full gateway URL, or set both
+ * `CF_AIG_ACCOUNT_ID` + `CF_AIG_GATEWAY_ID`. For an authenticated gateway, set
+ * `CF_AIG_TOKEN` (sent as `cf-aig-authorization: Bearer …`).
+ */
+export function aiGatewayConfig(
+  env: Record<string, string | undefined> = process.env,
+): AnthropicTransportConfig {
+  const explicit = env.ANTHROPIC_GATEWAY_BASE_URL?.trim();
+  const account = env.CF_AIG_ACCOUNT_ID?.trim();
+  const gateway = env.CF_AIG_GATEWAY_ID?.trim();
+
+  let baseURL: string | undefined;
+  if (explicit) baseURL = explicit;
+  else if (account && gateway) {
+    baseURL = `https://gateway.ai.cloudflare.com/v1/${account}/${gateway}/anthropic`;
+  }
+  if (!baseURL) return {};
+
+  const token = env.CF_AIG_TOKEN?.trim();
+  return {
+    baseURL,
+    ...(token ? { defaultHeaders: { "cf-aig-authorization": `Bearer ${token}` } } : {}),
+  };
+}
+
 export function getClient(): Anthropic {
   if (_client === null) {
-    _client = new Anthropic({ timeout: 30000, maxRetries: 1 });
+    _client = new Anthropic({ timeout: 30000, maxRetries: 1, ...aiGatewayConfig() });
   }
   return _client;
 }
