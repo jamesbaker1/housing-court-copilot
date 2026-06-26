@@ -26,7 +26,7 @@ import {
 } from "@/lib/llm/answer-draft";
 import { type FactualStatement } from "@/lib/case";
 import { screenTurn } from "@/lib/llm/advice-classifier";
-import { limitPublicApi } from "@/lib/ratelimit";
+import { limitPublicApi, checkLlmGlobalLimit } from "@/lib/ratelimit";
 import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
@@ -95,6 +95,15 @@ export async function POST(request: Request): Promise<NextResponse> {
     return NextResponse.json(
       { error: "challenge_failed", message: "Please complete the verification and try again." },
       { status: 403 },
+    );
+  }
+
+  // LLM global spend ceiling (M12): the last gate before any Anthropic call
+  // (incl. the advice classifier) so a cost-DoS cannot run up unbounded spend.
+  if (!(await checkLlmGlobalLimit())) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Service is temporarily at capacity. Please try again later." },
+      { status: 503 },
     );
   }
 

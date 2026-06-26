@@ -24,6 +24,9 @@ import type { Case, PostalAddress } from "@/lib/case";
 import { PostalAddressSchema } from "@/lib/case";
 import { getCase, patchCase } from "@/lib/store";
 import { lookupBuildingIntel, applyBuildingIntelToCase } from "@/lib/opendata";
+import { limitPublicApi } from "@/lib/ratelimit";
+import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
+import { authorizeCaseAccess, readAccessContext } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -36,6 +39,15 @@ function hasUsableAddress(a: PostalAddress | null | undefined): a is PostalAddre
 }
 
 export async function POST(req: Request): Promise<NextResponse> {
+  // Rate limit (cost-DoS protection on the open-data fan-out).
+  const limit = await limitPublicApi(req, "building");
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Too many requests. Please slow down." },
+      { status: 429 },
+    );
+  }
+
   let body: unknown;
   try {
     body = await req.json();
@@ -43,6 +55,18 @@ export async function POST(req: Request): Promise<NextResponse> {
     return NextResponse.json(
       { error: "invalid_json", message: "Request body must be valid JSON." },
       { status: 400 },
+    );
+  }
+
+  // Bot protection. Fails closed in production; open in dev when unconfigured.
+  const turnstile = await verifyTurnstile(
+    extractTurnstileToken(req, body),
+    req.headers.get("cf-connecting-ip"),
+  );
+  if (!turnstile.ok) {
+    return NextResponse.json(
+      { error: "challenge_failed", message: "Please complete the verification and try again." },
+      { status: 403 },
     );
   }
 
@@ -63,6 +87,17 @@ export async function POST(req: Request): Promise<NextResponse> {
   let loadedCase: Case | null = null;
 
   if (typeof case_id === "string" && case_id.length > 0) {
+    // OWNERSHIP GATE (M11): persisting open-data findings onto a Case is a write
+    // to that case — it requires proof of ownership, not just a loggable case_id.
+    // (Address-only PREVIEW below needs no case and stays open.) Uniform 403 so
+    // we never reveal whether the case exists.
+    const authz = await authorizeCaseAccess(case_id, readAccessContext(req));
+    if (!authz.ok) {
+      return NextResponse.json(
+        { error: "forbidden", message: "You must prove ownership of this case to access it." },
+        { status: 403 },
+      );
+    }
     loadedCase = await getCase(case_id);
     if (!loadedCase) {
       return NextResponse.json(

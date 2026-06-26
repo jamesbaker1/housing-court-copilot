@@ -156,6 +156,20 @@ export async function resolveAddressToBbl(
     }
 
     const confidence = mapConfidence(top?.properties?.confidence);
+    if (confidence === "failed") {
+      // WRONG-BUILDING GUARD: a low-confidence geocode must NOT surface a BBL.
+      // Downstream HPD/WoW lookups are gated on `!bbl`, so returning a BBL from a
+      // "failed" match would present a DIFFERENT building's violation/ownership
+      // records as this tenant's evidence. Drop the BBL and explain why.
+      return {
+        bbl: null,
+        geo_confidence: "failed",
+        bbl_resolved_via: null,
+        label: top?.properties?.label ?? null,
+        endpoint: url,
+        note: "GeoSearch match confidence was too low to trust this building; skipping building records.",
+      };
+    }
     return {
       bbl,
       geo_confidence: confidence,

@@ -1,0 +1,18 @@
+# Minimal Wrangler config used ONLY by the workers-pool Vitest project
+# (test/workers/*). It deliberately does NOT set `main = worker-entry.ts`
+# (which imports the gitignored .open-next build artifact); the pool spins up
+# its own runner and only needs the D1 binding + migrations so the auth/route
+# round-trip tests get a real, migrated D1 to exercise.
+# compatibility_date is pinned to a date the INSTALLED workerd supports (the
+# sandboxed runtime here tops out at 2024-12-30); the production wrangler.toml
+# uses the real, later date. nodejs_compat gives us node:crypto for the
+# session/auth tests.
+name = "housing-court-copilot-test"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "housing-court-copilot-test"
+database_id = "test"
+migrations_dir = "../../migrations"

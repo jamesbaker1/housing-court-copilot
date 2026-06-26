@@ -32,6 +32,9 @@ import {
   findValidSmsConsent,
   scheduleCourtDateReminders,
 } from "@/lib/reminders";
+import { limitPublicApi } from "@/lib/ratelimit";
+import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
+import { authorizeCaseAccess, readAccessContext } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
 
@@ -57,6 +60,15 @@ function twilioConfigured(): boolean {
 }
 
 export async function POST(req: Request): Promise<NextResponse> {
+  // Rate limit (cost / SMS-toll-fraud protection).
+  const limit = await limitPublicApi(req, "reminders");
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Too many requests. Please slow down." },
+      { status: 429 },
+    );
+  }
+
   let raw: unknown;
   try {
     const text = await req.text();
@@ -76,6 +88,30 @@ export async function POST(req: Request): Promise<NextResponse> {
     );
   }
   const { case_id, phone_e164 } = parsed.data;
+
+  // Bot protection. Fails closed in production; open in dev when unconfigured.
+  const turnstile = await verifyTurnstile(
+    extractTurnstileToken(req, raw),
+    req.headers.get("cf-connecting-ip"),
+  );
+  if (!turnstile.ok) {
+    return NextResponse.json(
+      { error: "challenge_failed", message: "Please complete the verification and try again." },
+      { status: 403 },
+    );
+  }
+
+  // OWNERSHIP GATE (M11): scheduling SMS reminders writes the tenant's phone +
+  // consent onto the Case — a write that must require proof of ownership, not the
+  // mere knowledge of a (loggable) case_id. Uniform 403 that does not reveal
+  // whether the case exists.
+  const authz = await authorizeCaseAccess(case_id, readAccessContext(req));
+  if (!authz.ok) {
+    return NextResponse.json(
+      { error: "forbidden", message: "You must prove ownership of this case to access it." },
+      { status: 403 },
+    );
+  }
 
   const existing = await getCase(case_id);
   if (!existing) {

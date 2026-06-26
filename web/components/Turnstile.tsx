@@ -82,12 +82,22 @@ function loadScript(): Promise<void> {
 export interface TurnstileProps {
   /** Called with the solved token, or null when it expires / errors / resets. */
   onToken: (token: string | null) => void;
+  /**
+   * The token the PARENT currently holds. When it transitions to null — i.e. the
+   * parent consumed/cleared it after a protected action — the widget RE-ISSUES a
+   * fresh token. Without this, Turnstile tokens are single-use, so the SECOND
+   * action on a surface (chat / stipulation / defenses / answer / intake) is
+   * permanently blocked in production until the widget expires (minutes later),
+   * dead-ending the flow. Optional: a caller that never re-uses a token can omit
+   * it for one-shot behavior.
+   */
+  token?: string | null;
   /** Optional Turnstile action label (shown in CF analytics). */
   action?: string;
   className?: string;
 }
 
-export default function Turnstile({ onToken, action, className = "" }: TurnstileProps) {
+export default function Turnstile({ onToken, token, action, className = "" }: TurnstileProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const widgetIdRef = useRef<string | null>(null);
   const onTokenRef = useRef(onToken);
@@ -95,11 +105,10 @@ export default function Turnstile({ onToken, action, className = "" }: Turnstile
   const reactId = useId();
 
   useEffect(() => {
-    // Dev fallback: no site key configured — emit the sentinel and render a hint.
-    if (!SITE_KEY) {
-      onTokenRef.current(DEV_TURNSTILE_TOKEN);
-      return;
-    }
+    // Dev fallback (no site key): the re-arm effect below emits the sentinel
+    // token (and re-emits it after each consume). In production we render the
+    // real widget here exactly once.
+    if (!SITE_KEY) return;
 
     let cancelled = false;
     void loadScript()
@@ -134,6 +143,28 @@ export default function Turnstile({ onToken, action, className = "" }: Turnstile
       widgetIdRef.current = null;
     };
   }, [action]);
+
+  // Re-arm: issue a FRESH token whenever the parent has consumed/cleared the
+  // current one (token === null / undefined). Closes the "second action is
+  // permanently blocked" bug — Turnstile tokens are single-use, so after the
+  // parent sends one it must get another. In dev we re-emit the sentinel; in
+  // production we reset the live widget (a reset re-runs the challenge and fires
+  // the callback again with a new token).
+  useEffect(() => {
+    if (token != null) return; // still holding a usable token — nothing to do
+    if (!SITE_KEY) {
+      onTokenRef.current(DEV_TURNSTILE_TOKEN);
+      return;
+    }
+    const id = widgetIdRef.current;
+    if (id != null && window.turnstile) {
+      try {
+        window.turnstile.reset(id);
+      } catch {
+        /* ignore — a failed reset leaves the token null and the caller blocks. */
+      }
+    }
+  }, [token]);
 
   if (!SITE_KEY) {
     // Visible, honest dev placeholder — never shipped to prod (site key is set there).

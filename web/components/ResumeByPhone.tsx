@@ -20,6 +20,14 @@
 import { useState } from "react";
 
 import Turnstile from "@/components/Turnstile";
+import { readStoredCaseToken } from "@/lib/caseClient";
+import { fetchWithTimeout } from "@/lib/fetch";
+import {
+  type Strings,
+  DEFAULT_LANGUAGE,
+  getStrings,
+  errorMessage,
+} from "@/lib/i18n";
 
 export interface ResumeByPhoneProps {
   /** The case currently being worked on; linked to the phone on success. */
@@ -32,6 +40,11 @@ export interface ResumeByPhoneProps {
    * a device that doesn't hold the per-case capability token.
    */
   onSession?: (session: { token: string; expires_at?: string }) => void;
+  /**
+   * Localized UI strings (M7). The copilot page passes its `t` so network-error
+   * messages are in the tenant's language. Falls back to English standalone.
+   */
+  strings?: Strings;
   className?: string;
 }
 
@@ -41,8 +54,10 @@ export default function ResumeByPhone({
   caseId,
   onLinked,
   onSession,
+  strings,
   className = "",
 }: ResumeByPhoneProps) {
+  const t = strings ?? getStrings(DEFAULT_LANGUAGE);
   const [open, setOpen] = useState(false);
   const [step, setStep] = useState<Step>("idle");
   const [phone, setPhone] = useState("");
@@ -75,9 +90,17 @@ export default function ResumeByPhone({
     }
     setBusy(true);
     try {
-      const res = await fetch("/api/auth/otp/request", {
+      // Prove ownership of THIS case so the server will link it to the phone:
+      // send the per-case capability token (held on the device that created the
+      // case). Without an ownership proof the server sends a code but links no
+      // case — preventing anyone who merely knows the case_id from binding it.
+      const caseToken = readStoredCaseToken();
+      const res = await fetchWithTimeout("/api/auth/otp/request", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(caseToken ? { Authorization: `Bearer ${caseToken}` } : {}),
+        },
         body: JSON.stringify({
           phone_e164,
           case_id: caseId,
@@ -95,8 +118,8 @@ export default function ResumeByPhone({
         data.message ??
           "If that number can receive texts, we sent a 6-digit code.",
       );
-    } catch {
-      setError("Network error. Please try again.");
+    } catch (err) {
+      setError(errorMessage(t, err, t.networkError));
     } finally {
       // The Turnstile token is single-use; force a re-solve before another send.
       setTurnstileToken(null);
@@ -114,7 +137,7 @@ export default function ResumeByPhone({
     }
     setBusy(true);
     try {
-      const res = await fetch("/api/auth/otp/verify", {
+      const res = await fetchWithTimeout("/api/auth/otp/verify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phone_e164: phone, code: code.trim() }),
@@ -137,8 +160,8 @@ export default function ResumeByPhone({
           ...(data.session_expires_at ? { expires_at: data.session_expires_at } : {}),
         });
       }
-    } catch {
-      setError("Network error. Please try again.");
+    } catch (err) {
+      setError(errorMessage(t, err, t.networkError));
     } finally {
       setBusy(false);
     }
@@ -220,7 +243,7 @@ export default function ResumeByPhone({
           </label>
           {/* Bot protection before we send any SMS. Dev shows a no-op placeholder
               and emits a sentinel token so local dev still works. */}
-          <Turnstile onToken={setTurnstileToken} action="otp_request" />
+          <Turnstile token={turnstileToken} onToken={setTurnstileToken} action="otp_request" />
           <button
             type="submit"
             disabled={busy || turnstileToken == null}

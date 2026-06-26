@@ -33,6 +33,7 @@ import {
   type AddEvidenceInput,
 } from "@/lib/evidence";
 import { tagEvidence } from "@/lib/llm/tag-evidence";
+import { limitPublicApi, checkLlmGlobalLimit } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
 
@@ -59,6 +60,15 @@ const RequestSchema = z.object({
 });
 
 export async function POST(req: Request): Promise<NextResponse> {
+  // Rate limit (cost-DoS protection).
+  const limit = await limitPublicApi(req, "evidence");
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Too many requests. Please slow down." },
+      { status: 429 },
+    );
+  }
+
   let body: unknown;
   try {
     body = await req.json();
@@ -112,6 +122,15 @@ export async function POST(req: Request): Promise<NextResponse> {
   // Optional LLM tagging pass over the provided content.
   let tagging_failed = false;
   if (input.auto_tag && input.content && input.content.trim().length > 0) {
+    // LLM global spend ceiling (M12): gate the ONLY model call in this route so a
+    // cost-DoS cannot run up unbounded spend. At capacity we skip tagging (the
+    // item is still added untagged) rather than fail the whole add.
+    if (!(await checkLlmGlobalLimit())) {
+      return NextResponse.json(
+        { case: updatedCase, item, tagging_failed: true, tagging_skipped: "at_capacity" },
+        { status: 201 },
+      );
+    }
     try {
       const { tags } = await tagEvidence({
         content: input.content,

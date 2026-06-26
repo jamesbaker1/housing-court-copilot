@@ -354,6 +354,19 @@ export function resolveHit(args: {
 
   const provenance = provenanceFor(hit.source);
 
+  // 0) CONFIDENCE GATE (INVARIANT #2): only ever ACT on a CONFIDENT hit. The
+  // polling orchestrator gates this before calling us, but the eTrack email-
+  // ingest path invokes resolveHit DIRECTLY — without this guard a medium/low
+  // confidence parse of a reminder email could flip court_date_verified or
+  // overwrite a date. A non-"high" hit does nothing.
+  if (hit.confidence !== "high") {
+    return {
+      status: "not_found",
+      tried: [hit.source],
+      note: `ignored ${hit.confidence}-confidence ${hit.source} hit (only high-confidence hits act)`,
+    };
+  }
+
   // 1) DISCREPANCY: a sourced date that disagrees with an existing
   // tenant-entered / document-extracted (unverified) date. NEVER silently
   // overwrite — record both + escalate for human review.
@@ -411,6 +424,38 @@ export function resolveHit(args: {
       court: withPart(set.court, hit.part),
       source: hit.source,
       agreed_with_existing: existingDate === hit.date,
+    };
+  }
+
+  // 2a-guard) PROTECT A VERIFIED DATE (INVARIANT #2): an UNTRUSTED (non-
+  // authoritative) hit must NEVER downgrade or silently overwrite a date that is
+  // already court-CONFIRMED (eTrack/NYSCEF-verified). If the untrusted hit AGREES
+  // with the verified date, do nothing (stay verified). If it DISAGREES, record a
+  // discrepancy and escalate — never clobber the verified date.
+  if (existingVerified && existingDate != null) {
+    if (existingDate === hit.date) {
+      return {
+        status: "not_found",
+        tried: [hit.source],
+        note: "untrusted hit agrees with the verified date; left unchanged",
+      };
+    }
+    const discrepancy: CourtDateDiscrepancy = {
+      existing_date: existingDate,
+      existing_source: existingSource,
+      sourced_date: hit.date,
+      sourced_source: provenance,
+      detected_at: nowIso(),
+    };
+    return {
+      status: "discrepancy",
+      discrepancy,
+      review: escalateReview(review),
+      warning:
+        `Court-date discrepancy: the ${hit.source} source reports ${hit.date}, ` +
+        `but the case has a VERIFIED date ${existingDate} ` +
+        `(${existingSource ?? "unknown source"}). The verified date was NOT ` +
+        `overwritten by the untrusted source; routed to a human for review.`,
     };
   }
 

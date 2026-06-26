@@ -301,6 +301,16 @@ export function scheduleReminders(
   for (const offset of cfg.offsets) {
     const sendDay = addCalendarDays(anchorDate, -offset);
     const scheduled_for = nyWallClockToUtcZ(sendDay, hh, mm);
+    // Skip offsets whose send instant is already past (e.g. a verification or
+    // opt-in that lands fewer days before the appearance than the offset). A
+    // past-dated reminder would be treated as due and fire immediately, bunching
+    // stale offsets into a single confusing burst — keep future reminders only.
+    if (Date.parse(scheduled_for) <= Date.parse(nowIso)) {
+      reasons.push(
+        `skipped ${offset}-day offset: send time ${scheduled_for} is already past as of ${nowIso}`,
+      );
+      continue;
+    }
     reminders.push({
       reminder_id: newReminderId(),
       channel: "sms",

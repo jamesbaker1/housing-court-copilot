@@ -167,6 +167,13 @@ export interface PurgeReport {
   purgedCaseIds: string[];
   startedAt: string;
   finishedAt: string;
+  /**
+   * Set when the top-level scan SELECT itself failed (D1/limiter down). An
+   * errored run did NOT scan the table, so its all-zero counts must NOT be read
+   * as "nothing to purge" — callers (the cron heartbeat) MUST treat this as a
+   * failed run. `undefined`/absent means the scan ran cleanly.
+   */
+  error?: string;
 }
 
 /**
@@ -176,7 +183,10 @@ export interface PurgeReport {
  * pointer: case_tokens + case_owners for the purged case_id are removed too.
  *
  * Idempotent and bounded (RETENTION_CONFIG.maxScanPerRun). Never throws to the
- * caller; per-row failures are counted, not fatal.
+ * caller; per-row failures are counted, not fatal. A failure of the top-level
+ * scan SELECT is reported (logged at error level + `report.error` set) rather
+ * than masked as an all-zero "nothing to purge" run, so the cron heartbeat does
+ * not signal success on a broken purge.
  */
 export async function runRetentionPurge(
   db: RetentionD1,
@@ -203,8 +213,15 @@ export async function runRetentionPurge(
       .bind(RETENTION_CONFIG.maxScanPerRun)
       .all<{ case_id: string; doc: string }>();
     rows = res.results ?? [];
-  } catch {
-    // Limiter/store down — fail closed toward NOT purging.
+  } catch (err) {
+    // Top-level scan SELECT failed (D1/limiter down) — fail closed toward NOT
+    // purging. CRITICAL: do NOT return a silent all-zero report; that is
+    // indistinguishable from a healthy "nothing to purge" run and would let the
+    // cron heartbeat report success while the purge is actually broken. Log at
+    // ERROR level and stamp report.error so the caller can detect the failure.
+    console.error("[retention] purge scan SELECT failed:", err);
+    report.error =
+      err instanceof Error ? err.message : "retention scan SELECT failed";
     report.finishedAt = new Date().toISOString();
     return report;
   }

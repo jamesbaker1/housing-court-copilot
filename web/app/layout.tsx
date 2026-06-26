@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { PERSISTENT_BANNER_SHORT } from "@/lib/disclaimers";
+import HtmlLangSync from "./HtmlLangSync";
 
 export const metadata: Metadata = {
   title: "Housing Court Copilot — a guide, not a lawyer",
@@ -38,9 +39,14 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
+  // SSR emits the en/ltr default (correct for unknown/no-JS tenants and the value
+  // React renders, so there is no hydration mismatch on the <html> attributes).
+  // <HtmlLangSync> then corrects lang/dir on the client to the tenant's chosen
+  // language (S5a — WCAG 3.1.1 / 1.3.2).
   return (
     <html lang="en">
       <body>
+        <HtmlLangSync />
         <PersistentBanner />
         <main className="mx-auto w-full max-w-2xl px-4 py-6">{children}</main>
       </body>

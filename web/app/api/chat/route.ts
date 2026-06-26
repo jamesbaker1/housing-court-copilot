@@ -34,13 +34,37 @@ import {
   streamCopilot,
   type LightGrounding,
 } from "@/lib/llm/copilot";
-import type { MessageParam } from "@/lib/anthropic";
+import { Anthropic, type MessageParam } from "@/lib/anthropic";
+import { coerceLanguage, getStrings, type Language } from "@/lib/i18n";
 import { getCase, patchCase } from "@/lib/store";
-import { limitPublicApi } from "@/lib/ratelimit";
+import { limitPublicApi, checkLlmGlobalLimit } from "@/lib/ratelimit";
 import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+// ---------------------------------------------------------------------------
+// Wait-time policy (S1). The proceed path buffers the whole reply before
+// surfacing it, so the client sees nothing until generation completes.
+// ---------------------------------------------------------------------------
+
+/**
+ * How often the proceed path emits a content-free `heartbeat` frame WHILE the
+ * reply buffers (await sdkStream.finalMessage()). Kept well under the client
+ * idle-read budget (lib/fetch.ts STREAM_IDLE_TIMEOUT_MS = 30_000) so a long
+ * generation never trips the client's stalled-stream timeout, AND so the
+ * waiting placeholder reads as alive at the highest-abandonment moment.
+ */
+const HEARTBEAT_INTERVAL_MS = 7_000;
+
+/**
+ * Server-side wall-clock cap on the buffered Anthropic call. Without this a
+ * wedged upstream could leave the request pending indefinitely (the client
+ * fetch budget, LLM_FETCH_TIMEOUT_MS, only bounds the INITIAL response, not the
+ * stream body, which is already flowing once heartbeats start). On timeout we
+ * abort the SDK stream and emit a fixed, code-tagged error frame (S10c).
+ */
+const STREAM_WALL_CLOCK_MS = 55_000;
 
 // ---------------------------------------------------------------------------
 // Request contract
@@ -108,6 +132,45 @@ function scanOutbound(text: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Failure-surfacing classifiers (S11 parts 2+3) — pure, deterministic.
+//
+// These decide HOW a degraded copilot turn is shown to a scared tenant, without
+// touching INVARIANT #1 (the advice classifier still runs first; these only
+// change how a refusal/truncation/overload is surfaced). Kept module-private:
+// a Next.js route module may not export symbols other than the HTTP handlers, so
+// these can't be unit-tested in isolation. The i18n copy they surface is.
+// ---------------------------------------------------------------------------
+
+/**
+ * True when the buffered final message stopped in a way that yields no usable
+ * answer — a safety `refusal` (empty/declined content) or a `max_tokens`
+ * truncation (a cut-off, possibly mid-sentence reply). In both cases we must NOT
+ * surface the empty/truncated text; we route the tenant to a human instead.
+ * Any other stop reason (incl. null/end_turn) is a normal, surfaceable reply.
+ */
+function isUnusableStop(stopReason: string | null | undefined): boolean {
+  return stopReason === "refusal" || stopReason === "max_tokens";
+}
+
+/**
+ * True when an error thrown from the Anthropic stream is a transient capacity
+ * problem we should surface as "busy, try again shortly" rather than the generic
+ * failure copy: HTTP 429 (rate_limit_error) or 529 (overloaded_error). We match
+ * on the SDK's typed `status` (APIError subclasses carry it) and fall back to a
+ * structural `status` read so a serialized/rewrapped error is still caught.
+ */
+function isOverloadError(err: unknown): boolean {
+  if (err instanceof Anthropic.APIError) {
+    return err.status === 429 || err.status === 529;
+  }
+  if (err != null && typeof err === "object") {
+    const status = (err as { status?: unknown }).status;
+    return status === 429 || status === 529;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // NDJSON streaming helpers
 // ---------------------------------------------------------------------------
 
@@ -115,6 +178,20 @@ type ChatEvent =
   | { type: "routed"; payload: ReturnType<typeof buildNonAdviceResponse> }
   | { type: "text"; delta: string }
   | { type: "done" }
+  | {
+      /**
+       * Liveness frame (S1). The proceed path BUFFERS the entire reply server-
+       * side (await sdkStream.finalMessage()) before any text is surfaced — a
+       * deliberate 10-40s wait so the outbound scanner runs first. We emit a
+       * content-free heartbeat every {@link HEARTBEAT_INTERVAL_MS} during that
+       * wait so (a) the UI can keep the placeholder visibly alive at the highest-
+       * abandonment moment, and (b) the client idle-read budget
+       * (readWithIdleTimeout, STREAM_IDLE_TIMEOUT_MS=30s) can't fire mid-
+       * generation. It carries NO model content and runs AFTER the advice
+       * classifier + ahead of the outbound scanner (invariant #1 untouched).
+       */
+      type: "heartbeat";
+    }
   | {
       /**
        * Advisory UI hint ONLY. The route handler is the conversational advice
@@ -127,7 +204,18 @@ type ChatEvent =
       review: unknown;
       audit_event?: unknown;
     }
-  | { type: "error"; message: string };
+  | {
+      /**
+       * Failure frame. `message` is a FIXED, non-sensitive sentinel (never raw
+       * err.message — that can carry model ids / D1 SQL / Zod paths, S10c); the
+       * detail is logged server-side instead. `code` is a stable tag the client
+       * can localize against (it currently maps any error to the localized
+       * t.chatError, so no per-code branch is required on the wire).
+       */
+      type: "error";
+      message: string;
+      code?: string;
+    };
 
 function enc(ev: ChatEvent): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(ev) + "\n");
@@ -254,11 +342,26 @@ export async function POST(req: NextRequest): Promise<Response> {
     }
   }
 
+  // Global daily LLM circuit-breaker (fail-CLOSED) — last gate before any
+  // Anthropic call. Checked after the per-IP limiter + Turnstile so a tripped
+  // global cap doesn't mask cheaper rejections; denies (and never consumes) when
+  // the breaker is tripped OR the meter is unreadable (caps total Anthropic spend).
+  if (!(await checkLlmGlobalLimit())) {
+    return Response.json(
+      { error: "rate_limited", message: "Service is temporarily at capacity. Please try again later." },
+      { status: 429 },
+    );
+  }
+
   // Build the message list for the copilot (history + current turn).
   const messages: MessageParam[] = [
     ...history,
     { role: "user", content: message },
   ];
+
+  // The tenant's language, for any server-authored copy surfaced on a degraded
+  // turn (S11). coerceLanguage falls back to English for an unknown/absent value.
+  const language: Language = coerceLanguage(caseObject?.language);
 
   // 1. Screen the turn (fail-closed deterministic decision).
   let route;
@@ -266,7 +369,7 @@ export async function POST(req: NextRequest): Promise<Response> {
     route = await screenTurn({
       turnText: message,
       turnContext,
-      language: caseObject?.language ?? "en",
+      language,
     });
   } catch {
     // Even the screen failing routes to a human (fail closed, §7.1).
@@ -306,16 +409,81 @@ export async function POST(req: NextRequest): Promise<Response> {
   // surfacing — the deterministic English scanner runs uniformly.
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      // S1: keep the wait alive. The reply is fully buffered below, so emit a
+      // content-free heartbeat every HEARTBEAT_INTERVAL_MS while we await it.
+      // This both animates the client placeholder at the highest-abandonment
+      // moment AND keeps the client idle-read budget (readWithIdleTimeout, 30s)
+      // from firing mid-generation. Cleared in the finally before close.
+      let heartbeat: ReturnType<typeof setInterval> | undefined = setInterval(() => {
+        try {
+          controller.enqueue(enc({ type: "heartbeat" }));
+        } catch {
+          // The stream may already be closing; a failed enqueue is harmless.
+        }
+      }, HEARTBEAT_INTERVAL_MS);
+      const stopHeartbeat = () => {
+        if (heartbeat !== undefined) {
+          clearInterval(heartbeat);
+          heartbeat = undefined;
+        }
+      };
+
       try {
         const sdkStream = streamCopilot({ messages, caseObject, lightGrounding });
 
         // §2.5: buffer + scan ALL copilot output (not just borderline) before
         // surfacing. A confidently-misclassified turn that elicits a forbidden
         // construction is caught here and re-routed to a human, server-side.
-        const final = await sdkStream.finalMessage();
+        //
+        // S1: bound the buffered call with a server-side wall clock. The client
+        // fetch budget only covers the INITIAL response (heartbeats keep the
+        // stream "responsive"), so a wedged upstream would otherwise hang here
+        // indefinitely. On timeout we abort the SDK stream and throw, surfacing
+        // the fixed, code-tagged error frame via the catch below (S10c).
+        const final = await Promise.race([
+          sdkStream.finalMessage(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => {
+              try {
+                sdkStream.abort();
+              } catch {
+                // Best-effort: aborting a settled stream is a no-op.
+              }
+              reject(new Error("copilot stream wall-clock timeout"));
+            }, STREAM_WALL_CLOCK_MS),
+          ),
+        ]);
         const text = final.content
           .map((b) => (b.type === "text" ? b.text : ""))
           .join("");
+
+        // The buffered reply is in hand; the long wait is over. Stop the
+        // heartbeat before surfacing anything (covers both branches below).
+        stopHeartbeat();
+
+        // S11 (part 2): the model declined (stop_reason "refusal") or was cut off
+        // (stop_reason "max_tokens"). Either way the buffered text is empty or
+        // truncated — NEVER surface it. Route the tenant to a human using the same
+        // fixed non-advice / route-to-human path the scanner uses below, and
+        // persist the advice-routed transition server-side (single-writer #4). The
+        // advice classifier already ran (INVARIANT #1 untouched); this only changes
+        // how an unusable model reply is surfaced.
+        if (isUnusableStop(final.stop_reason)) {
+          const persisted = await persistAdviceRouted(caseId, route.runs);
+          controller.enqueue(enc({ type: "routed", payload: buildNonAdviceResponse() }));
+          if (persisted != null) {
+            controller.enqueue(
+              enc({
+                type: "review_update",
+                review: persisted.review,
+                audit_event: persisted.audit_event,
+              }),
+            );
+          }
+          controller.enqueue(enc({ type: "done" }));
+          controller.close();
+          return;
+        }
 
         const flagged = scanOutbound(text);
         if (flagged) {
@@ -347,14 +515,44 @@ export async function POST(req: NextRequest): Promise<Response> {
         controller.enqueue(enc({ type: "done" }));
         controller.close();
       } catch (err) {
+        // The wait is over (success or failure) — stop the heartbeat before
+        // surfacing anything (the finally below is the backstop).
+        stopHeartbeat();
+
+        // S11 (part 3): a transient capacity error from the stream (Anthropic
+        // 429 rate_limit / 529 overloaded). Surface the localized "assistant is
+        // busy, try again shortly" copy as a normal reply frame instead of the
+        // generic failure — a scared tenant shouldn't read a temporary blip as
+        // "this is broken." This is FIXED, server-authored copy (not model
+        // output), so it bypasses the outbound scanner safely. The advice
+        // classifier already ran (INVARIANT #1 untouched).
+        if (isOverloadError(err)) {
+          console.warn("[chat] copilot stream overloaded (429/529):", err);
+          const t = getStrings(language);
+          controller.enqueue(enc({ type: "text", delta: t.assistantBusy }));
+          controller.enqueue(enc({ type: "done" }));
+          controller.close();
+          return;
+        }
+
+        // S10c: NEVER put raw err.message on the wire — it can carry model ids
+        // (claude-opus-4-8), D1/SQL text, or Zod paths. Log the detail server-
+        // side in the existing tagged style, and emit a FIXED, code-tagged
+        // sentinel. The client maps any error frame to the localized t.chatError
+        // (it ignores the wire `message`), so the tenant sees in-language copy.
+        console.error("[chat] copilot stream failed:", err);
         controller.enqueue(
           enc({
             type: "error",
-            message:
-              err instanceof Error ? err.message : "copilot stream failed",
+            code: "chat_stream_failed",
+            message: "copilot stream failed",
           }),
         );
         controller.close();
+      } finally {
+        // Defensive: ensure the heartbeat is never left running (e.g. if the
+        // wall-clock race rejected before stopHeartbeat() was reached).
+        stopHeartbeat();
       }
     },
   });

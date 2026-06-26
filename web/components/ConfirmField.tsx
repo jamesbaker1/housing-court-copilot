@@ -133,18 +133,18 @@ export default function ConfirmField({
       </div>
 
       {conf && (
-        <p className={["mt-1 text-xs", conf.tone].join(" ")}>{conf.text}</p>
+        <p className={["mt-1 text-sm", conf.tone].join(" ")}>{conf.text}</p>
       )}
 
       {critical && (
-        <p className="mt-2 text-xs text-deadline-700">
+        <p className="mt-2 text-sm text-deadline-700">
           Missing your court date can lead to losing your case automatically (a
           &ldquo;default&rdquo;). We never trust this date until you confirm it
           against your official court papers.
         </p>
       )}
 
-      {hint && <p className="mt-1 text-xs opacity-80">{hint}</p>}
+      {hint && <p className="mt-1 text-sm opacity-80">{hint}</p>}
 
       {mode === "prompt" && !confirmed && (
         <div className="mt-3 flex flex-wrap gap-2">
@@ -152,7 +152,7 @@ export default function ConfirmField({
             <button
               type="button"
               onClick={onConfirm}
-              className="rounded-md bg-trust-600 px-4 py-2 text-sm font-semibold text-white hover:bg-trust-700 focus:outline-none focus:ring-2 focus:ring-trust-400"
+              className="min-h-[44px] rounded-md bg-trust-600 px-4 py-2 text-sm font-semibold text-white hover:bg-trust-700 focus:outline-none focus:ring-2 focus:ring-trust-400"
             >
               {confirmLabel}
             </button>
@@ -163,7 +163,7 @@ export default function ConfirmField({
               setMode("correcting");
               setDraft("");
             }}
-            className="rounded-md border border-trust-400 bg-white px-4 py-2 text-sm font-semibold text-trust-800 hover:bg-trust-50 focus:outline-none focus:ring-2 focus:ring-trust-400"
+            className="min-h-[44px] rounded-md border border-trust-400 bg-white px-4 py-2 text-sm font-semibold text-trust-800 hover:bg-trust-50 focus:outline-none focus:ring-2 focus:ring-trust-400"
           >
             {unreadable ? enterLabel : correctLabel}
           </button>
@@ -175,7 +175,7 @@ export default function ConfirmField({
           <button
             type="button"
             onClick={() => setMode("correcting")}
-            className="text-sm font-medium text-trust-700 underline underline-offset-2"
+            className="inline-flex min-h-[44px] items-center px-1 text-sm font-medium text-trust-700 underline underline-offset-2"
           >
             Change this
           </button>

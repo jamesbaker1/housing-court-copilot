@@ -28,6 +28,7 @@
 import { createHash, randomInt, timingSafeEqual } from "node:crypto";
 
 import { sendSms } from "@/lib/sms/twilio";
+import { authorizeCaseAccess, type AccessContext } from "@/lib/auth/session";
 
 // E.164, matching ContactSchema.phone_e164 in @/lib/case.
 const E164_RE = /^\+[1-9]\d{1,14}$/;
@@ -77,6 +78,25 @@ function generateCode(): string {
   return String(randomInt(0, 1_000_000)).padStart(6, "0");
 }
 
+/** True iff `phone` is already a recorded owner of `caseId` (case_owners link). */
+async function isPhoneLinkedToCase(
+  db: D1Database,
+  phoneE164: string,
+  caseId: string,
+): Promise<boolean> {
+  try {
+    const row = await db
+      .prepare(
+        `SELECT 1 AS ok FROM case_owners WHERE case_id = ?1 AND phone_e164 = ?2`,
+      )
+      .bind(caseId, phoneE164)
+      .first<{ ok: number }>();
+    return !!row;
+  } catch {
+    return false;
+  }
+}
+
 /** Constant-time equality for two hex digests of equal length. */
 function hashesEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -103,8 +123,10 @@ export type RequestOtpResult =
 export async function requestOtp(args: {
   phone_e164: string;
   case_id: string;
+  /** Bearer secrets off the request — used to PROVE ownership before linking. */
+  ctx: AccessContext;
 }): Promise<RequestOtpResult> {
-  const { phone_e164, case_id } = args;
+  const { phone_e164, case_id, ctx } = args;
   if (!E164_RE.test(phone_e164)) {
     return { ok: false, reason: "invalid_phone" };
   }
@@ -118,6 +140,18 @@ export async function requestOtp(args: {
     // so do not pretend to send. Caller surfaces a generic "try again" message.
     return { ok: false, reason: "unavailable" };
   }
+
+  // SECURITY — account-takeover prevention. case_id is a NON-SECRET, loggable
+  // locator (see lib/auth/session.ts); it must NOT, by itself, authorize binding
+  // a case to a phone. Only PIN the case to link on verify if the caller PROVES
+  // ownership: either this phone is ALREADY a linked owner (a legitimate
+  // cross-device resume) OR the request carries a valid capability token / owner
+  // session for THIS case. Otherwise we still send a code (the requester only
+  // ever controls their OWN phone, so this leaks nothing — anti-enumeration is
+  // preserved) but pin NO case, so verify links nothing and grants no access.
+  const alreadyLinked = await isPhoneLinkedToCase(db, phone_e164, case_id);
+  const authorized = alreadyLinked || (await authorizeCaseAccess(case_id, ctx)).ok;
+  const pinnedCaseId = authorized ? case_id : "";
 
   const code = generateCode();
   const codeHash = hashCode(phone_e164, code);
@@ -136,7 +170,7 @@ export async function requestOtp(args: {
            expires_at = excluded.expires_at,
            attempts = 0`,
       )
-      .bind(phone_e164, codeHash, case_id, expiresAt)
+      .bind(phone_e164, codeHash, pinnedCaseId, expiresAt)
       .run();
   } catch {
     return { ok: false, reason: "unavailable" };
@@ -242,14 +276,20 @@ export async function verifyOtp(args: {
       .bind(phone_e164, ts)
       .run();
 
-    await db
-      .prepare(
-        `INSERT INTO case_owners (case_id, phone_e164, linked_at)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(case_id, phone_e164) DO NOTHING`,
-      )
-      .bind(caseId, phone_e164, ts)
-      .run();
+    // Link ONLY when a real, ownership-proven case was pinned at request time.
+    // An empty/invalid pin (requestOtp's unauthorized path) verifies the phone
+    // but links no case — so a caller who could not prove ownership gains access
+    // to NOTHING new (only whatever cases this phone already owned).
+    if (CASE_ID_RE.test(caseId)) {
+      await db
+        .prepare(
+          `INSERT INTO case_owners (case_id, phone_e164, linked_at)
+           VALUES (?1, ?2, ?3)
+           ON CONFLICT(case_id, phone_e164) DO NOTHING`,
+        )
+        .bind(caseId, phone_e164, ts)
+        .run();
+    }
 
     // Consume the code so it can't be replayed.
     await db
@@ -260,8 +300,10 @@ export async function verifyOtp(args: {
     return { ok: false, reason: "unavailable" };
   }
 
-  // Return all cases this phone owns (so the tenant can pick one to resume).
-  let caseIds: string[] = [caseId];
+  // Return all cases this phone OWNS (so the tenant can pick one to resume).
+  // Derived from case_owners — never from the (possibly empty) pinned id — so an
+  // unauthorized requester gets back only the cases their phone genuinely owns.
+  let caseIds: string[] = [];
   try {
     const { results } = await db
       .prepare(
@@ -272,9 +314,9 @@ export async function verifyOtp(args: {
     caseIds = results
       .map((r) => r.case_id)
       .filter((id) => CASE_ID_RE.test(id));
-    if (caseIds.length === 0) caseIds = [caseId];
   } catch {
-    // fall back to just the freshly linked case
+    // Best-effort: fall back to the freshly linked case only if one was linked.
+    if (CASE_ID_RE.test(caseId)) caseIds = [caseId];
   }
 
   return { ok: true, case_ids: caseIds };

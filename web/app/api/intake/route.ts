@@ -27,7 +27,7 @@ import {
   type IntakeMediaType,
 } from "@/lib/llm/extract";
 import type { Borough, CaseType, Money } from "@/lib/case";
-import { limitPublicApi } from "@/lib/ratelimit";
+import { limitPublicApi, checkLlmGlobalLimit } from "@/lib/ratelimit";
 import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
@@ -168,6 +168,15 @@ export async function POST(request: Request): Promise<Response> {
     typeof body.language === "string" && body.language.length > 0
       ? body.language
       : "en";
+
+  // LLM global spend ceiling (M12): the last gate before any Anthropic call so a
+  // cost-DoS cannot run up unbounded model spend. Fails closed when unmetered.
+  if (!(await checkLlmGlobalLimit())) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Service is temporarily at capacity. Please try again later." },
+      { status: 503 },
+    );
+  }
 
   // Run extraction + classification.
   let extraction;

@@ -15,6 +15,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { requestOtp } from "@/lib/auth/otp";
+import { readAccessContext } from "@/lib/auth/session";
 import { checkOtpSendLimit, clientIp } from "@/lib/ratelimit";
 import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
@@ -74,9 +75,13 @@ export async function POST(req: Request): Promise<NextResponse> {
   }
 
   // Fire and forget the outcome: we never surface it to the client.
+  // ctx carries the caller's bearer secrets so requestOtp can PROVE ownership
+  // before pinning the case to this phone (account-takeover IDOR fix): case_id
+  // alone (a non-secret locator) must never authorize binding a case to a phone.
   await requestOtp({
     phone_e164: parsed.data.phone_e164,
     case_id: parsed.data.case_id,
+    ctx: readAccessContext(req),
   });
 
   return NextResponse.json(GENERIC_OK, { status: 200 });

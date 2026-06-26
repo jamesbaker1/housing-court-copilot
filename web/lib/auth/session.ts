@@ -162,6 +162,50 @@ export async function revokeCaseTokens(caseId: string): Promise<void> {
   }
 }
 
+/**
+ * Delete-cascade for owner bindings (REVIEW fix #1). On a tenant delete the
+ * per-case `case_owners` links MUST be removed, AND any owner session whose ONLY
+ * authorization was this case must be revoked — otherwise a previously-authorized
+ * session (or a later reuse of the same case_id) could resurrect access to a case
+ * that no longer exists. A phone that still owns ANOTHER case keeps its session.
+ * Never throws.
+ */
+export async function revokeCaseOwnerBindings(caseId: string): Promise<void> {
+  if (!CASE_ID_RE.test(caseId)) return;
+  const db = await getDB();
+  if (!db) return;
+  try {
+    // The phones currently linked to this case (their sessions may need revoking).
+    const { results: phones } = await db
+      .prepare(`SELECT phone_e164 FROM case_owners WHERE case_id = ?1`)
+      .bind(caseId)
+      .all<{ phone_e164: string }>();
+
+    // Drop the per-case ownership links.
+    await db
+      .prepare(`DELETE FROM case_owners WHERE case_id = ?1`)
+      .bind(caseId)
+      .run();
+
+    // For each formerly-linked phone that no longer owns ANY case, revoke its
+    // owner sessions so a stale bearer cannot re-authorize anything.
+    for (const { phone_e164 } of phones ?? []) {
+      const stillOwns = await db
+        .prepare(`SELECT 1 AS ok FROM case_owners WHERE phone_e164 = ?1 LIMIT 1`)
+        .bind(phone_e164)
+        .first<{ ok: number }>();
+      if (!stillOwns) {
+        await db
+          .prepare(`UPDATE owner_sessions SET revoked = 1 WHERE phone_e164 = ?1`)
+          .bind(phone_e164)
+          .run();
+      }
+    }
+  } catch {
+    // best-effort
+  }
+}
+
 // --- owner sessions ---------------------------------------------------------
 
 /**

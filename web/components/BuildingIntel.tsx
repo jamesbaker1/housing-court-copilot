@@ -25,6 +25,7 @@ import { useMemo, useState } from "react";
 import Disclaimer from "@/components/Disclaimer";
 import { DisclaimerContext } from "@/lib/disclaimers";
 import type { EvidenceItem } from "@/lib/case";
+import { fetchWithTimeout } from "@/lib/fetch";
 
 // Mirror of lib/opendata findings — kept structural to avoid importing a
 // server-only module (lib/opendata pulls node fetch + the store transitively
@@ -155,7 +156,11 @@ function VerifyControl({
         "Content-Type": "application/json",
       };
       if (caseToken) headers["Authorization"] = `Bearer ${caseToken}`;
-      const res = await fetch(`/api/cases/${caseId}`, {
+      // Route through fetchWithTimeout (the M6 wrapper) so a slow/dropped
+      // connection on the tenant's borrowed phone can't hang this PATCH forever.
+      // On timeout it throws FetchTimeoutError; the catch below surfaces the
+      // message inline and the finally re-enables the button (no dead-end).
+      const res = await fetchWithTimeout(`/api/cases/${caseId}`, {
         method: "PATCH",
         headers,
         body: JSON.stringify({ evidence: updatedEvidence }),

@@ -31,7 +31,7 @@ import { TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
 import { getCase, patchCase } from "@/lib/store";
 import { OPUS } from "@/lib/anthropic";
 import type { Audit, AttorneyReview, Case } from "@/lib/case";
-import { limitPublicApi } from "@/lib/ratelimit";
+import { limitPublicApi, checkLlmGlobalLimit } from "@/lib/ratelimit";
 import { verifyTurnstile, extractTurnstileToken } from "@/lib/turnstile";
 
 export const runtime = "nodejs";
@@ -160,6 +160,16 @@ export async function POST(request: Request): Promise<Response> {
           "Missing or unsupported `mediaType`. Supported: application/pdf, image/jpeg, image/png, image/gif, image/webp. Convert HEIC to JPEG/PNG before upload.",
       },
       { status: 400 },
+    );
+  }
+
+  // Global daily LLM circuit-breaker (fail-CLOSED) — last gate before the
+  // (expensive vision) Anthropic call. After the per-IP limiter + Turnstile;
+  // denies (and never consumes) when tripped OR the meter is unreadable.
+  if (!(await checkLlmGlobalLimit())) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Service is temporarily at capacity. Please try again later." },
+      { status: 429 },
     );
   }
 

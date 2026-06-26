@@ -585,10 +585,14 @@ export type SatisfactionState =
  *
  * Note on the structured tag: the spec rides the tenant-attested marker on a
  * timeline event kind="other" with a structured tag. The canonical
- * TimelineEvent has no tags[] field, so we look for the tag in the event's
+ * TimelineEvent has no tags[] field, so we bind the tag to the event's
  * `description` (the only free-text carrier) as a pragmatic v1 binding; the
- * caller should write the tag verbatim into the description when recording the
- * attestation. TODO: if a structured tag field is added to TimelineEvent,
+ * caller must write the tag verbatim as the entire description when recording
+ * the attestation. We require an EXACT match (not a substring) so an incidental
+ * occurrence of the tag inside unrelated free-text (e.g. an LLM-generated note
+ * that quotes the tag) cannot be mistaken for a legally-operative attestation
+ * and wrongly suppress an imminent/missed/default-risk warning — the dangerous
+ * direction. TODO: if a structured tag field is added to TimelineEvent,
  * switch to reading it directly.
  */
 export function evaluateSatisfied(
@@ -614,7 +618,7 @@ export function evaluateSatisfied(
       (e) =>
         e.kind === "other" &&
         e.date_is_authoritative === false &&
-        e.description.includes(tag),
+        e.description.trim() === tag,
     );
   if (attested && sig.tenant_attested_clears_missed) return "tenant_attested";
 

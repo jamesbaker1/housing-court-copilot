@@ -20,10 +20,15 @@
 import { useState, useId } from "react";
 import {
   DisclaimerContext,
-  getDisclaimer,
   TALK_TO_A_PERSON_CTA,
   type DisclaimerContextValue,
 } from "@/lib/disclaimers";
+import {
+  type Strings,
+  DEFAULT_LANGUAGE,
+  getStrings,
+  getLocalizedDisclaimer,
+} from "@/lib/i18n";
 
 export interface DisclaimerProps {
   context: DisclaimerContext | DisclaimerContextValue;
@@ -34,11 +39,25 @@ export interface DisclaimerProps {
    * for `panel`. Always available regardless of variant.
    */
   showTalkToAPerson?: boolean;
+  /**
+   * Localized UI strings (M10). When passed, the contextual disclaimer copy and
+   * the "talk to a person" CTA render in the tenant's language. Falls back to
+   * English when omitted (standalone usage). The hotline PHONE is never
+   * translated (it's a dialable number).
+   */
+  strings?: Strings;
   className?: string;
 }
 
 /** Small, friendly "talk to a person" link with the free-help hotline. */
-export function TalkToAPersonLink({ className = "" }: { className?: string }) {
+export function TalkToAPersonLink({
+  strings,
+  className = "",
+}: {
+  strings?: Strings;
+  className?: string;
+}) {
+  const t = strings ?? getStrings(DEFAULT_LANGUAGE);
   return (
     <a
       href={`tel:${TALK_TO_A_PERSON_CTA.hotlinePhone}`}
@@ -50,7 +69,7 @@ export function TalkToAPersonLink({ className = "" }: { className?: string }) {
         .join(" ")}
     >
       <span aria-hidden="true">💬</span>
-      {TALK_TO_A_PERSON_CTA.action}
+      {t.talkToAPerson.action}
     </a>
   );
 }
@@ -59,9 +78,11 @@ export default function Disclaimer({
   context,
   variant = "panel",
   showTalkToAPerson,
+  strings,
   className = "",
 }: DisclaimerProps) {
-  const { label, body } = getDisclaimer(context);
+  const t = strings ?? getStrings(DEFAULT_LANGUAGE);
+  const { label, body } = getLocalizedDisclaimer(t, String(context));
   const isDeadline = String(context) === DisclaimerContext.Deadline;
   const baseClass = isDeadline ? "hcc-deadline" : "hcc-verify";
   const wantsCta = showTalkToAPerson ?? variant === "panel";
@@ -97,7 +118,7 @@ export default function Disclaimer({
             <p>{body}</p>
             {wantsCta && (
               <p className="mt-2">
-                <TalkToAPersonLink />
+                <TalkToAPersonLink strings={t} />
               </p>
             )}
           </div>
@@ -119,7 +140,7 @@ export default function Disclaimer({
       <p className="mt-1">{body}</p>
       {wantsCta && (
         <p className="mt-2">
-          <TalkToAPersonLink />
+          <TalkToAPersonLink strings={t} />
         </p>
       )}
     </div>

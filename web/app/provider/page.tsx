@@ -15,7 +15,7 @@
  * the requesting provider's `prv`. Treat this as an internal prototype only.
  */
 
-import { listCases, getCase } from "@/lib/store";
+import { listConsentedCases, getCase } from "@/lib/store";
 import TriageList, {
   hasGrantedHandoffConsent,
   toTriageRow,
@@ -26,11 +26,16 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 async function loadQueue(): Promise<TriageRow[]> {
-  const summaries = await listCases();
+  // PERF (S12): consent-filter at the SQL/index level (idx_cases_consent_court_date)
+  // so we only getCase() the CONSENTED subset rather than full-reading every Case's
+  // PII blob. toTriageRow needs the full Case, so each consented id is still read.
+  const summaries = await listConsentedCases();
   const rows: TriageRow[] = [];
   for (const s of summaries) {
     const c = await getCase(s.case_id);
     if (!c) continue;
+    // Defensive re-check (fail-closed): listConsentedCases() already filtered,
+    // but a consent could lapse between the list query and this read.
     if (!hasGrantedHandoffConsent(c)) continue;
     rows.push(toTriageRow(c));
   }
@@ -78,14 +83,16 @@ export default async function ProviderQueuePage() {
         </p>
       </div>
 
-      {/* v1 security warning, visible in-product. */}
+      {/* Scope/redaction caveat, visible in-product. Access now gates the surface,
+          but per-provider scoping + data_categories redaction are still pending. */}
       <div
         role="note"
         className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800"
       >
-        <strong>Prototype — no authentication.</strong> This console has no login
-        or per-provider scoping yet. Do not use with real tenant data until
-        provider authn/authz is implemented.
+        <strong>Limited-access surface.</strong> Cloudflare Access gates this
+        console and the provider API. Per-provider consent scoping and
+        data_categories redaction are still pending — do not treat a listed
+        intake as scoped to your org yet.
       </div>
 
       <TriageList rows={rows} />

@@ -38,6 +38,14 @@ interface CronEnv {
   DB?: unknown;
   /** Ops/attorney gate forwarded to the court-source connector (see wrangler.toml). */
   COURT_DATA_VENDOR_AUTHORITATIVE?: string;
+  /**
+   * Dead-man-switch endpoint for the retention purge (healthchecks.io-style).
+   * On a SUCCESSFUL purge run we GET this URL as a heartbeat; on a FAILED run we
+   * GET `<url>/fail`. When the monitor stops receiving heartbeats it alerts ops
+   * — so a silently broken or non-running cron is caught, not just a loud throw.
+   * Unset => no ping (safe no-op for envs without a monitor configured).
+   */
+  HEALTHCHECK_PURGE_URL?: string;
 }
 
 interface ScheduledController {
@@ -82,6 +90,26 @@ async function readRawEmail(message: EmailMessage): Promise<string> {
   return new TextDecoder("utf-8").decode(merged);
 }
 
+/**
+ * Fire a dead-man-switch heartbeat for the retention purge. `ok=false` pings the
+ * healthchecks.io-style `/fail` sub-path so the monitor records an explicit
+ * failure. No-op (resolves) when no URL is configured. Best-effort: a ping that
+ * fails (network/monitor down) is logged but never propagated — the purge result
+ * is the source of truth, the ping is only observability.
+ */
+async function pingPurgeHealthcheck(
+  url: string | undefined,
+  ok: boolean,
+): Promise<void> {
+  if (!url) return; // monitor not configured — silent no-op.
+  const target = ok ? url : `${url.replace(/\/$/, "")}/fail`;
+  try {
+    await fetch(target, { method: "GET" });
+  } catch (err) {
+    console.error("[cron] purge healthcheck ping failed:", err);
+  }
+}
+
 export default {
   // HTTP: delegate verbatim to the OpenNext worker.
   fetch: (openNextWorker as { fetch: (...a: unknown[]) => Promise<Response> }).fetch,
@@ -95,21 +123,39 @@ export default {
     const job = (async () => {
       const db = env.DB;
       if (!db) {
-        console.warn("[cron] retention purge skipped: no DB binding");
+        // No DB binding to purge against — this is a misconfigured run, not a
+        // healthy one; signal failure so the monitor does not record a success.
+        console.error("[cron] retention purge skipped: no DB binding");
+        ctx.waitUntil(pingPurgeHealthcheck(env.HEALTHCHECK_PURGE_URL, false));
         return;
       }
       try {
         const { runRetentionPurge, sweepEphemeral } = await import("./lib/retention");
         const report = await runRetentionPurge(db as never);
         await sweepEphemeral(db as never);
+        // The purge distinguishes a scan failure from an empty run: report.error
+        // means the top-level scan SELECT failed and the run did NOT actually
+        // purge. Do NOT send a success heartbeat in that case.
+        if (report.error) {
+          console.error(
+            `[cron] retention purge errored cron=${controller.cron} ` +
+              `error=${report.error}`,
+          );
+          ctx.waitUntil(pingPurgeHealthcheck(env.HEALTHCHECK_PURGE_URL, false));
+          return;
+        }
         // PII-free operational log line.
         console.log(
           `[cron] retention purge done cron=${controller.cron} ` +
             `scanned=${report.scanned} purged=${report.purged} held=${report.held} ` +
             `kept=${report.kept} unparseable=${report.unparseable}`,
         );
+        // Positive success heartbeat: the dead-man-switch only stays "up" while
+        // these arrive, so a cron that stops running (or fails) is detected.
+        ctx.waitUntil(pingPurgeHealthcheck(env.HEALTHCHECK_PURGE_URL, true));
       } catch (err) {
         console.error("[cron] retention purge failed:", err);
+        ctx.waitUntil(pingPurgeHealthcheck(env.HEALTHCHECK_PURGE_URL, false));
       }
     })();
     ctx.waitUntil(job);

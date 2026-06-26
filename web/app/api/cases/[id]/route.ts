@@ -28,6 +28,7 @@ import {
   authorizeCaseAccess,
   readAccessContext,
   revokeCaseTokens,
+  revokeCaseOwnerBindings,
 } from "@/lib/auth/session";
 
 export const runtime = "nodejs";
@@ -140,9 +141,11 @@ export async function DELETE(
   if (!authz.ok) return forbidden();
 
   const existed = await deleteCase(id);
-  // Revoke the capability tokens regardless so a stale token can't resurrect
-  // access (best-effort; never throws).
+  // Revoke the capability tokens AND the owner bindings regardless, so neither a
+  // stale capability token nor a previously-authorized owner session (nor a later
+  // reuse of this case_id) can resurrect access. Best-effort; never throws.
   await revokeCaseTokens(id);
+  await revokeCaseOwnerBindings(id);
 
   if (!existed) {
     return NextResponse.json(

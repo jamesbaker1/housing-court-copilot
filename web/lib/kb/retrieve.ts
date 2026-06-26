@@ -94,6 +94,18 @@ const { docs: INDEX, idf: IDF } = buildIndex();
 /** Extra multiplier when a query term also appears in the entry's tags. */
 const TAG_BOOST = 1.75;
 
+/**
+ * Relevance floor. A hit must clear BOTH a small absolute floor (drops lone
+ * near-noise hits where a query merely shares one tangential tag/term with an
+ * entry) AND a fraction of the top hit's score (drops trailing weak matches that
+ * sit far behind a strong, genuinely-relevant top hit). The point: a barely-
+ * matching entry must never be surfaced as a "VETTED SOURCE" to cite — when
+ * nothing clears the floor the result is empty and the copilot says it is not
+ * sure (see buildKbGrounding's "no vetted entry matched" branch).
+ */
+const MIN_SCORE = 0.1;
+const REL_SCORE = 0.18;
+
 function scoreDoc(doc: IndexedDoc, queryTerms: string[]): number {
   let score = 0;
   for (const term of queryTerms) {
@@ -113,10 +125,12 @@ function scoreDoc(doc: IndexedDoc, queryTerms: string[]): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Retrieve the top-`k` corpus entries for `query`, best first. Entries with no
- * term overlap (score 0) are excluded, so the result may be shorter than `k`
- * (and empty when nothing in the curated corpus is relevant — the copilot then
- * says it is not sure and routes to a person).
+ * Retrieve the top-`k` corpus entries for `query`, best first. Entries that do
+ * not clear the relevance floor (see {@link MIN_SCORE} / {@link REL_SCORE}) are
+ * excluded, so the result may be shorter than `k` — and empty when nothing in
+ * the curated corpus is relevant enough to cite, in which case the copilot says
+ * it is not sure and routes to a person. This floor is what stops a single
+ * tangential keyword from grounding an authoritative-looking citation.
  */
 export function retrieve(query: string, k = 4): KbHit[] {
   const queryTerms = tokenize(query ?? "");
@@ -129,5 +143,12 @@ export function retrieve(query: string, k = 4): KbHit[] {
   }
 
   hits.sort((a, b) => b.score - a.score || a.entry.id.localeCompare(b.entry.id));
-  return hits.slice(0, Math.max(0, k));
+
+  // Drop weak matches below the floor (absolute AND relative-to-top). Hits are
+  // sorted, so the first is the top score.
+  const top = hits[0]?.score ?? 0;
+  const floor = Math.max(MIN_SCORE, top * REL_SCORE);
+  const cleared = hits.filter((h) => h.score >= floor);
+
+  return cleared.slice(0, Math.max(0, k));
 }

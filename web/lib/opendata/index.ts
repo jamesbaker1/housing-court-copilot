@@ -226,9 +226,10 @@ export async function lookupBuildingIntel(
   }
 
   // 5) WoW → ownership_record evidence + corroborate landlord owner/portfolio id.
+  let wowAssertion: OpenDataAssertion | null = null;
   let wowOwnerName: string | null = null;
   if (wow.ok) {
-    const wowAssertion = buildOpenDataAssertion({
+    wowAssertion = buildOpenDataAssertion({
       dataset: "justfix_wow",
       datasetVersion: wow.dataset_last_updated ?? retrievedAt,
       retrievedAt,
@@ -251,16 +252,18 @@ export async function lookupBuildingIntel(
     wowOwnerName = wow.registered_owner_name;
   }
 
-  // Compose the landlord patch. We attach the registration OpenDataAssertion to
-  // parties.landlord.open_data (the §4/§9 home that assemble_packet scans).
+  // Compose the landlord patch. The attached open_data gate (the §4/§9 home that
+  // assemble_packet scans) MUST match the provenance of the owner name that was
+  // actually written, so a reviewer traces the value to the right dataset.
   if (registration.ok || wow.ok) {
-    landlordPatch = {
-      registered_owner_name:
-        registration.registered_owner_name ?? wowOwnerName ?? null,
-      wow_landlord_id: wow.ok ? wow.wow_landlord_id : null,
-      registration_on_file: registration.ok ? registration.registration_on_file : null,
-      open_data: registrationAssertion,
-    };
+    landlordPatch = composeLandlordPatch({
+      registrationOwnerName: registration.ok ? registration.registered_owner_name : null,
+      registrationAssertion,
+      wowOwnerName,
+      wowAssertion,
+      wowLandlordId: wow.ok ? wow.wow_landlord_id : null,
+      registrationOnFile: registration.ok ? registration.registration_on_file : null,
+    });
   }
 
   return {
@@ -281,6 +284,48 @@ export async function lookupBuildingIntel(
       bbl_resolved_via: geo.bbl_resolved_via ?? undefined,
       geo_confidence: geo.geo_confidence,
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Landlord-patch composition (pure)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the parties.landlord patch from the registration + WoW signals, keeping
+ * the attached open_data gate's provenance aligned with the owner-name value:
+ *
+ *  - The registered owner name prefers the HPD-registration value; it only falls
+ *    back to the WoW (JustFix aggregator) value when registration has none.
+ *  - The attached open_data assertion is the one whose dataset/endpoint/disclaimer
+ *    actually describes the written owner name — registration's when the name is
+ *    registration-sourced, WoW's when it is WoW-sourced — so a reviewer never
+ *    traces the value to the wrong source or applies the wrong staleness caveat.
+ *  - Whenever ANY open-data value is written to parties.landlord, a verify gate is
+ *    attached (registration's, else WoW's), so the landlord party can never carry
+ *    ungated open-data content past computeOpenDataBlock.
+ */
+export function composeLandlordPatch(input: {
+  registrationOwnerName: string | null;
+  registrationAssertion: OpenDataAssertion | null;
+  wowOwnerName: string | null;
+  wowAssertion: OpenDataAssertion | null;
+  wowLandlordId: string | null;
+  registrationOnFile: boolean | null;
+}): LandlordParty {
+  const ownerFromRegistration = input.registrationOwnerName != null;
+  const registered_owner_name = input.registrationOwnerName ?? input.wowOwnerName ?? null;
+  // Attach the assertion that matches the owner name's provenance. If the name is
+  // registration-sourced (or absent) prefer the registration gate; only fall back
+  // to the WoW gate when the registration gate is missing.
+  const open_data = ownerFromRegistration
+    ? (input.registrationAssertion ?? input.wowAssertion ?? null)
+    : (input.wowAssertion ?? input.registrationAssertion ?? null);
+  return {
+    registered_owner_name,
+    wow_landlord_id: input.wowLandlordId,
+    registration_on_file: input.registrationOnFile,
+    open_data,
   };
 }
 

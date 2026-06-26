@@ -142,6 +142,31 @@ const DAY = 24 * HOUR;
 /** Per-IP rule for the LLM-backed public endpoints (cost-DoS protection). */
 export const PUBLIC_API_RULE: RateLimitRule = { limit: 30, windowMs: MINUTE };
 
+/**
+ * Global daily LLM-call ceiling across ALL IPs — a hard circuit-breaker on total
+ * Anthropic spend (every LLM route shares this one bucket). Unlike the per-IP
+ * limiter above (which FAILS OPEN so a downed D1 never locks out a real tenant),
+ * this ceiling FAILS CLOSED: once it is tripped — or whenever the meter cannot be
+ * read/consumed (no D1 binding, DB error) — LLM calls are DENIED. The whole point
+ * of the breaker is to cap runaway cost, so an unmeterable state must not be a
+ * free pass to bill an unbounded number of Anthropic calls.
+ *
+ * COST ENVELOPE: 2,000 LLM requests/day. Each LLM route makes ~1-2 Anthropic
+ * calls (the fail-closed advice classifier on Haiku, escalating to Sonnet, plus
+ * the authoring model — Opus for chat/answer/stipulation, Sonnet for defenses).
+ * At a conservative blended ~$0.05-0.15/request that bounds the daily Anthropic
+ * bill to roughly the low hundreds of dollars even under sustained abuse — a
+ * survivable worst case for a volunteer-funded tool, vs. an unbounded bill
+ * without the breaker.
+ *
+ * OPERATOR CONFIG (out of code scope): this in-app breaker is the last line of
+ * defense, not the first. Also configure (1) an Anthropic Console monthly budget
+ * alert and (2) a Cloudflare Workers analytics request-spike alert so a human is
+ * paged BEFORE this hard cap is reached. Those live in dashboards, not code.
+ */
+export const LLM_GLOBAL_DAILY_RULE: RateLimitRule = { limit: 2000, windowMs: DAY };
+const LLM_GLOBAL_BUCKET = "llm_global";
+
 /** OTP send limits (SMS toll-fraud + harassment). */
 export const OTP_PER_PHONE_RULE: RateLimitRule = { limit: 3, windowMs: HOUR };
 export const OTP_PER_IP_RULE: RateLimitRule = { limit: 10, windowMs: HOUR };
@@ -211,4 +236,58 @@ export async function checkOtpSendLimit(
   if (!global.allowed) return { allowed: false, reason: "global_daily" };
 
   return { allowed: true, reason: null };
+}
+
+/**
+ * Global daily LLM-call circuit-breaker — peek-then-consume against ONE shared
+ * bucket, FAILING CLOSED. Mirrors the OTP global-daily pattern but inverts the
+ * failure posture: where {@link rateLimit} fails OPEN on a missing binding / DB
+ * error (a downed limiter must not lock out a tenant), this breaker DENIES in
+ * those same states because its sole job is to cap Anthropic spend — an
+ * unmeterable meter must not become an unbounded bill.
+ *
+ * Returns `allowed=false` when (a) no D1 backend is bound, (b) a DB error occurs,
+ * or (c) the daily count is at/over {@link LLM_GLOBAL_DAILY_RULE.limit}. On the
+ * cleared path it consumes one unit (atomic UPSERT-increment) and allows.
+ *
+ * Call this AFTER the per-IP limiter + Turnstile so a tripped global cap doesn't
+ * mask cheaper rejections; it is the last gate before the Anthropic call.
+ */
+export async function checkLlmGlobalLimit(): Promise<boolean> {
+  const db = await getDB();
+  if (!db) return false; // No meter → fail closed (cannot bound spend).
+
+  const windowMs = LLM_GLOBAL_DAILY_RULE.windowMs;
+  const windowStart = Math.floor(Date.now() / windowMs);
+
+  try {
+    // Peek FIRST: if already at/over the cap, deny without incrementing (keeps
+    // the breaker from churning the count once tripped).
+    const peeked = await db
+      .prepare(
+        `SELECT count FROM rate_limits WHERE bucket_key = ?1 AND window_start = ?2`,
+      )
+      .bind(LLM_GLOBAL_BUCKET, windowStart)
+      .first<{ count: number }>();
+    if ((peeked?.count ?? 0) >= LLM_GLOBAL_DAILY_RULE.limit) return false;
+
+    // Consume one unit. The RETURNING gives the post-increment count so a racing
+    // request that pushed us over the cap is still denied.
+    const row = await db
+      .prepare(
+        `INSERT INTO rate_limits (bucket_key, window_start, count, updated_at)
+         VALUES (?1, ?2, 1, ?3)
+         ON CONFLICT(bucket_key, window_start) DO UPDATE SET
+           count = count + 1,
+           updated_at = excluded.updated_at
+         RETURNING count`,
+      )
+      .bind(LLM_GLOBAL_BUCKET, windowStart, nowIso())
+      .first<{ count: number }>();
+    const count = row?.count ?? LLM_GLOBAL_DAILY_RULE.limit + 1;
+    return count <= LLM_GLOBAL_DAILY_RULE.limit;
+  } catch {
+    // DB error → fail closed (an unmeterable breaker must not pass spend).
+    return false;
+  }
 }

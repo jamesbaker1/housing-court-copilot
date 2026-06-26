@@ -24,10 +24,12 @@ import {
   OPUS,
   type MessageParam,
 } from "@/lib/anthropic";
+import { TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
 import {
-  PERSISTENT_BANNER,
-  TALK_TO_A_PERSON_CTA,
-} from "@/lib/disclaimers";
+  type Language,
+  DEFAULT_LANGUAGE,
+  getStrings,
+} from "@/lib/i18n";
 import type {
   AttorneyReview,
   Case,
@@ -385,14 +387,29 @@ export function streamCopilotWithSources(opts: CopilotStreamOptions): {
 // The fixed non-advice response (GUARDRAILS-SPEC §1.7)
 // ---------------------------------------------------------------------------
 
+/**
+ * The "talk to a person / free help" CTA shape surfaced in a hard-route. Mirrors
+ * @/lib/disclaimers.TALK_TO_A_PERSON_CTA but typed structurally so a LOCALIZED
+ * CTA (M10) is assignable. The `hotlinePhone` is never translated (it's a
+ * dialable number, sourced from the English CTA).
+ */
+export interface NonAdviceCta {
+  heading: string;
+  body: string;
+  action: string;
+  hotlineName: string;
+  hotlinePhone: string;
+  hotlineNote: string;
+}
+
 /** Shape of the fixed response shown when a turn is hard-routed to a human. */
 export interface NonAdviceResponse {
   /** True — this is the suppressed-answer path. */
   routed: true;
   /** Body copy. Acknowledges the question, states the AI can't answer it. */
   message: string;
-  /** The "talk to a person / free help" CTA from @/lib/disclaimers. */
-  cta: typeof TALK_TO_A_PERSON_CTA;
+  /** The "talk to a person / free help" CTA (localized when a language is given). */
+  cta: NonAdviceCta;
   /** The full persistent disclaimer (§4 requires the full form here). */
   disclaimer: string;
 }
@@ -402,17 +419,32 @@ export interface NonAdviceResponse {
  * hard-routed. It does NOT restate the tenant's question in a way that implies
  * an answer, contains no defense/probability/"you should"/"you have a case"
  * construction, and carries the full persistent disclaimer.
+ *
+ * M10: the human-facing STRINGS are localized to the tenant's language so the
+ * advice hard-route-to-a-human (the UPL protection) is comprehensible to a
+ * limited-English tenant. This is string localization ONLY — the routing
+ * DECISION and the `advice_routed` flag remain server-side (see the route
+ * handler + {@link applyAdviceRouted}); `routed: true` is always set here. The
+ * `language` defaults to English so existing call sites are unchanged.
  */
-export function buildNonAdviceResponse(): NonAdviceResponse {
+export function buildNonAdviceResponse(
+  language: Language = DEFAULT_LANGUAGE,
+): NonAdviceResponse {
+  const t = getStrings(language);
   return {
     routed: true,
-    message:
-      "That's an important question — and it's exactly the kind a real person should answer, " +
-      "not me. I can't tell you what to do or whether you have a case; a lawyer needs to look " +
-      "at your specific situation for that. I've flagged your question for the legal team, and " +
-      "free help is available right now.",
-    cta: TALK_TO_A_PERSON_CTA,
-    disclaimer: PERSISTENT_BANNER,
+    message: t.routedChatBody,
+    cta: {
+      heading: t.talkToAPerson.heading,
+      body: t.talkToAPerson.body,
+      action: t.talkToAPerson.action,
+      // The hotline phone is a dialable number — sourced from the English CTA,
+      // never translated.
+      hotlinePhone: TALK_TO_A_PERSON_CTA.hotlinePhone,
+      hotlineName: t.talkToAPerson.hotlineName,
+      hotlineNote: t.talkToAPerson.hotlineNote,
+    },
+    disclaimer: t.disclaimers.persistentBanner,
   };
 }
 

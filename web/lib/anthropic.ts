@@ -53,12 +53,22 @@ export type ModelName = typeof OPUS | typeof HAIKU | typeof SONNET;
  * Shared singleton client. `new Anthropic()` resolves ANTHROPIC_API_KEY from the
  * environment. Constructed lazily so importing this module doesn't throw at
  * build time when the key is absent.
+ *
+ * Explicit timeout + retry bound (S11): the SDK defaults are timeout=600000ms
+ * (10 min) and maxRetries=2, so wall-clock can reach timeout*(maxRetries+1) =
+ * 30 min — far over the Cloudflare Worker budget. We pin timeout to 30s and
+ * maxRetries to 1 (max ~60s wall-clock). Note the SDK auto-scales the default
+ * timeout up for large max_tokens on NON-streaming requests, but an explicit
+ * `timeout` disables that scaling — which is fine here: both streaming paths
+ * (`chatStream` maxTokens 64000, `streamChat` maxTokens 2048) stream, and
+ * `structuredExtract` (maxTokens up to 16000) completes well within 30s.
+ * (SDK timeout is in MILLISECONDS for the TypeScript SDK.)
  */
 let _client: Anthropic | null = null;
 
 export function getClient(): Anthropic {
   if (_client === null) {
-    _client = new Anthropic();
+    _client = new Anthropic({ timeout: 30000, maxRetries: 1 });
   }
   return _client;
 }

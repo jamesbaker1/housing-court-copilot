@@ -48,6 +48,8 @@ import ResumeByPhone from "@/components/ResumeByPhone";
 import Turnstile from "@/components/Turnstile";
 import RegisterInEtrack from "@/components/RegisterInEtrack";
 import { DisclaimerContext, TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
+import { fetchWithTimeout, fetchLlm } from "@/lib/fetch";
+import { downscaleImage } from "@/lib/image";
 import type { Case, CaseType, ConfidenceLevel, EvidenceItem } from "@/lib/case";
 import {
   type Language,
@@ -56,8 +58,11 @@ import {
   LANGUAGE_ENDONYMS,
   coerceLanguage,
   getStrings,
+  errorMessage,
+  formatStepProgress,
   isFullyTranslated,
   isRtl,
+  type Strings,
 } from "@/lib/i18n";
 // Same-device auth contract (per-case capability token in localStorage,
 // presented as Authorization: Bearer on every gated /api/cases call). Shared
@@ -272,21 +277,6 @@ function mapFields(map: ExtractedFieldsMap | undefined): UiField[] {
   return out;
 }
 
-/** Read a File as base64 (no data: prefix). */
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result;
-      if (typeof result !== "string") return reject(new Error("read failed"));
-      const comma = result.indexOf(",");
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
-    reader.readAsDataURL(file);
-  });
-}
-
 const SUPPORTED_MEDIA = new Set([
   "application/pdf",
   "image/jpeg",
@@ -294,6 +284,14 @@ const SUPPORTED_MEDIA = new Set([
   "image/gif",
   "image/webp",
 ]);
+
+/**
+ * Max base64 payload we'll POST (S3). ~6.5M base64 chars ≈ 4.8MB of binary —
+ * comfortably under typical Worker request-body limits. A client-side downscale
+ * almost always brings a phone photo well under this; the guard is the friendly
+ * backstop for the rare huge PDF / undecodable image that bypassed the resize.
+ */
+const MAX_B64 = 6_500_000;
 
 type Step = 1 | 2 | 3 | 4 | 5 | 6 | 7;
 
@@ -391,14 +389,31 @@ export default function CopilotPage() {
   languageRef.current = language;
   const t = getStrings(language);
 
-  // Turnstile tokens for the two public entry points (single-use; null until solved).
+  // Turnstile tokens for the public LLM entry points (single-use; null until
+  // solved). Each protected action holds its own token and re-solves after use.
   const [intakeTurnstile, setIntakeTurnstile] = useState<string | null>(null);
+  const [defensesTurnstile, setDefensesTurnstile] = useState<string | null>(null);
+  const [answerTurnstile, setAnswerTurnstile] = useState<string | null>(null);
 
   const [intake, setIntake] = useState<IntakeResponse | null>(null);
   const [fields, setFields] = useState<UiField[]>([]);
 
   const [intakeBusy, setIntakeBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // S2: an object-URL preview of the uploaded image, shown (with a spinner +
+  // staged reassurance copy) while intake runs so the step never reads as frozen.
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  // S2: index into the staged "reading your papers…" reassurance phrases.
+  const [readingStage, setReadingStage] = useState(0);
+
+  // S8 (continuity on borrowed phones): non-blocking notes. Neither hard-fails
+  // the flow — the court notice is always the source of truth.
+  // True when localStorage is unavailable (incognito / blocked): saving across
+  // sessions won't work, but the in-memory flow does.
+  const [storageBlocked, setStorageBlocked] = useState(false);
+  // True when POST /api/cases was rate-limited (NAT-shared 429) or otherwise
+  // failed: we couldn't mint a persisted case, but the tenant can keep going.
+  const [persistUnavailable, setPersistUnavailable] = useState(false);
 
   // Defenses
   const [defenses, setDefenses] = useState<DefenseChecklistItem[] | null>(null);
@@ -450,6 +465,17 @@ export default function CopilotPage() {
       /* ignore */
     }
 
+    // S8: probe localStorage once. In incognito / blocked-storage browsers, the
+    // set/remove throws; surface a NON-blocking note so the tenant knows this
+    // case may not be here next time — the flow stays fully usable either way.
+    try {
+      const k = "__hcc_probe__";
+      window.localStorage.setItem(k, "1");
+      window.localStorage.removeItem(k);
+    } catch {
+      if (!cancelled) setStorageBlocked(true);
+    }
+
     async function init() {
       let existing: string | null = null;
       let existingToken: string | null = null;
@@ -463,7 +489,7 @@ export default function CopilotPage() {
       if (existing) {
         try {
           // Present the capability token; the route is owner-gated now.
-          const res = await fetch(
+          const res = await fetchWithTimeout(
             `/api/cases/${existing}`,
             existingToken
               ? { headers: { Authorization: `Bearer ${existingToken}` } }
@@ -495,7 +521,7 @@ export default function CopilotPage() {
       }
 
       try {
-        const res = await fetch("/api/cases", {
+        const res = await fetchWithTimeout("/api/cases", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ language: languageRef.current }),
@@ -522,9 +548,18 @@ export default function CopilotPage() {
               /* ignore storage failures */
             }
           }
+        } else if (!cancelled) {
+          // S8: couldn't mint a persisted case (a NAT-shared 429 rate-limit is
+          // the common cause on borrowed/shared connections). Surface a
+          // NON-blocking note and keep going with a null caseId — the chat falls
+          // back to sessionId and reminders show their own no-case note. We do
+          // NOT clear the in-memory flow and the hotline stays visible.
+          setPersistUnavailable(true);
         }
       } catch {
-        // Persistence unavailable — the flow still works in-memory.
+        // Persistence unavailable — the flow still works in-memory. Surface the
+        // same non-blocking note so the tenant isn't left wondering (S8).
+        if (!cancelled) setPersistUnavailable(true);
       }
     }
 
@@ -552,7 +587,7 @@ export default function CopilotPage() {
     if (!id) return;
     void (async () => {
       try {
-        const res = await fetch(`/api/cases/${id}`, {
+        const res = await fetchWithTimeout(`/api/cases/${id}`, {
           method: "PATCH",
           headers: caseAuthHeaders(),
           body: JSON.stringify(patch),
@@ -590,20 +625,37 @@ export default function CopilotPage() {
 
   async function onFile(file: File) {
     setError(null);
-    const mediaType = file.type;
-    if (!SUPPORTED_MEDIA.has(mediaType)) {
+    // Guard the ORIGINAL file type (downscale re-encodes images to JPEG, but the
+    // accept set is what the tenant is actually allowed to upload).
+    if (!SUPPORTED_MEDIA.has(file.type)) {
       setError(t.unsupportedFile);
       return;
     }
+    // S2: show a thumbnail of an image upload while we read it. Revoke any prior
+    // preview first to avoid leaking object URLs.
+    if (file.type.startsWith("image/")) {
+      setPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(file);
+      });
+    }
     setIntakeBusy(true);
     try {
-      const base64Data = await fileToBase64(file);
-      const res = await fetch("/api/intake", {
+      // S3: downscale + re-encode images (PDFs pass through untouched) BEFORE
+      // base64 — the single biggest low-bandwidth win at the make-or-break step.
+      const { data: base64Data, mediaType: sendType } = await downscaleImage(file);
+      // S3: friendly max-payload backstop. A downscaled photo is normally far
+      // under this; this catches the rare oversized PDF / undecodable image.
+      if (base64Data.length > MAX_B64) {
+        setError(t.fileTooLarge);
+        return;
+      }
+      const res = await fetchLlm("/api/intake", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           base64Data,
-          mediaType,
+          mediaType: sendType,
           language: languageRef.current,
           ...(intakeTurnstile ? { turnstileToken: intakeTurnstile } : {}),
         }),
@@ -613,8 +665,8 @@ export default function CopilotPage() {
       setIntake(data);
       setFields(mapFields(data.extractedFields));
       setStep(2);
-    } catch {
-      setError(t.couldNotReadFile);
+    } catch (err) {
+      setError(errorMessage(t, err, t.couldNotReadFile));
     } finally {
       // A Turnstile token is single-use; force a re-solve before the next upload.
       setIntakeTurnstile(null);
@@ -657,10 +709,14 @@ export default function CopilotPage() {
 
   async function loadDefenses() {
     if (defenses || defensesBusy) return;
+    // Bot protection: the server fails closed in prod, so wait for a token. The
+    // step-5 Turnstile widget re-triggers this once it solves (in dev the
+    // sentinel arrives immediately, so this loads right away locally).
+    if (defensesTurnstile == null) return;
     setDefensesBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/defenses", {
+      const res = await fetchLlm("/api/defenses", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -669,15 +725,18 @@ export default function CopilotPage() {
             .filter((f) => f.confirmed)
             .map((f) => `${f.label}: ${f.displayValue}`)
             .join("\n"),
+          ...(defensesTurnstile ? { turnstileToken: defensesTurnstile } : {}),
         }),
       });
       if (!res.ok) throw new Error();
       const data = (await res.json()) as DefensesResponse;
       setDefenses(data.defenses_checklist ?? []);
-    } catch {
-      setError("We couldn't load possible issues right now. You can try again.");
+    } catch (err) {
+      setError(errorMessage(t, err, t.defensesError));
       setDefenses([]);
     } finally {
+      // The Turnstile token is single-use; force a re-solve before another load.
+      setDefensesTurnstile(null);
       setDefensesBusy(false);
     }
   }
@@ -686,15 +745,21 @@ export default function CopilotPage() {
 
   async function buildDraft() {
     const raw = narrative.trim();
-    if (!raw || answerBusy) return;
+    // Bot protection: the server fails closed in prod, so gate on a token (the
+    // step-6 widget emits a sentinel immediately in dev).
+    if (!raw || answerBusy || answerTurnstile == null) return;
     setAnswerBusy(true);
     setAnswerRouted(false);
     setError(null);
     try {
-      const res = await fetch("/api/answer", {
+      const res = await fetchLlm("/api/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ raw_statements: raw, language: languageRef.current }),
+        body: JSON.stringify({
+          raw_statements: raw,
+          language: languageRef.current,
+          ...(answerTurnstile ? { turnstileToken: answerTurnstile } : {}),
+        }),
       });
       if (!res.ok) throw new Error();
       const data = (await res.json()) as AnswerResponse;
@@ -703,9 +768,11 @@ export default function CopilotPage() {
       setAnswerText(assembled);
       setAnswerLoaded(true);
       if (data.route_to_human) setAnswerRouted(true);
-    } catch {
-      setError("We couldn't build a draft right now. You can try again.");
+    } catch (err) {
+      setError(errorMessage(t, err, t.answerError));
     } finally {
+      // The Turnstile token is single-use; force a re-solve before another draft.
+      setAnswerTurnstile(null);
       setAnswerBusy(false);
     }
   }
@@ -729,7 +796,7 @@ export default function CopilotPage() {
     setReminderBusy(true);
     setReminderNote(null);
     try {
-      const res = await fetch("/api/reminders", {
+      const res = await fetchWithTimeout("/api/reminders", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ case_id: id, phone_e164: e164, consent: true }),
@@ -756,8 +823,8 @@ export default function CopilotPage() {
           "Reminders are scheduled. (Text sending isn't switched on in this environment yet, so no message will be sent until the service is live.)",
         );
       }
-    } catch {
-      setReminderNote("Network error saving your reminders. You can try again.");
+    } catch (err) {
+      setReminderNote(errorMessage(t, err, t.networkError));
     } finally {
       setReminderBusy(false);
     }
@@ -786,7 +853,7 @@ export default function CopilotPage() {
       return;
     }
     try {
-      const res = await fetch("/api/building", {
+      const res = await fetchWithTimeout("/api/building", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -800,8 +867,8 @@ export default function CopilotPage() {
       // The route persists evidence with verify_before_file = unverified; pick up
       // the refreshed Case so the verify gates render against real evidence.
       if (data.case) setPersistedCase(data.case);
-    } catch {
-      setError("We couldn't look up your building right now. You can try again.");
+    } catch (err) {
+      setError(errorMessage(t, err, t.buildingError));
     } finally {
       setBuildingBusy(false);
     }
@@ -821,7 +888,7 @@ export default function CopilotPage() {
         .join(" ")
         .trim() || "housing court nonpayment case basics";
     try {
-      const res = await fetch("/api/kb", {
+      const res = await fetchWithTimeout("/api/kb", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query, k: 4 }),
@@ -836,14 +903,48 @@ export default function CopilotPage() {
 
   function goTo(next: Step) {
     setError(null);
-    if (next === 5) void loadDefenses();
+    // Step 5 (defenses) is bot-protected: its load is driven by an effect once
+    // the step-5 Turnstile widget produces a token (see below). We don't call
+    // loadDefenses() eagerly here — it would no-op before the token solves.
     if (next === 4 && kbSources.length === 0) void loadKbSources();
     setStep(next);
   }
 
+  // Kick off the defenses load once step 5 is active AND its Turnstile token has
+  // solved (in dev the sentinel arrives immediately). loadDefenses() guards on
+  // `defenses`/`defensesBusy`, so this fires the request exactly once.
+  useEffect(() => {
+    if (step === 5 && defensesTurnstile != null && !defenses && !defensesBusy) {
+      void loadDefenses();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, defensesTurnstile]);
+
+  // S2: advance the staged "reading your papers…" reassurance copy every ~4s
+  // while intake is running, so a 10-30s+ OCR never reads as frozen. Resets to
+  // the first stage whenever a new read begins, and clamps at the last stage.
+  useEffect(() => {
+    if (!intakeBusy) {
+      setReadingStage(0);
+      return;
+    }
+    const id = window.setInterval(() => {
+      setReadingStage((s) => Math.min(s + 1, 2));
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [intakeBusy]);
+
+  // S2: revoke the preview object URL on unmount to avoid leaking it.
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewUrl]);
+
   return (
     <div className="space-y-5" dir={isRtl(language) ? "rtl" : "ltr"} lang={language}>
-      <StepHeader step={step} />
+      <StepHeader step={step} strings={t} />
 
       <div className="flex items-center justify-between gap-2">
         <LanguageSelector
@@ -874,12 +975,29 @@ export default function CopilotPage() {
       )}
 
       {error && (
-        <p
+        <div
           role="alert"
-          className="rounded-md bg-deadline-50 px-3 py-2 text-sm text-deadline-700"
+          className="space-y-2 rounded-md bg-deadline-50 px-3 py-2 text-sm text-deadline-700"
         >
-          {error}
-        </p>
+          <p>{error}</p>
+          {/* Surface the human handoff INLINE at the moment of failure (M7): the
+              persistent hotline card only shows on step 7, so a tenant who hits an
+              error earlier shouldn't have to hunt for free help. */}
+          <p className="text-xs text-deadline-800">
+            <span className="font-medium">{t.needHelpNow}</span>{" "}
+            <TalkToAPersonLink strings={t} />
+          </p>
+          <div className="rounded-md bg-white/60 px-2 py-1.5 text-xs text-deadline-900">
+            <p className="font-medium">{t.talkToAPerson.hotlineName}</p>
+            <p className="mt-0.5">{t.talkToAPerson.hotlineNote}</p>
+            <a
+              href={`tel:${TALK_TO_A_PERSON_CTA.hotlinePhone}`}
+              className="mt-1 inline-block font-semibold text-trust-700 underline underline-offset-2"
+            >
+              Call {TALK_TO_A_PERSON_CTA.hotlinePhone}
+            </a>
+          </div>
+        </div>
       )}
 
       {step > 2 && courtDateField?.confirmed && (
@@ -891,11 +1009,31 @@ export default function CopilotPage() {
           <button
             type="button"
             onClick={() => setStep(2)}
-            className="shrink-0 text-xs font-medium text-trust-700 underline underline-offset-2"
+            className="inline-flex min-h-[44px] shrink-0 items-center text-sm font-medium text-trust-700 underline underline-offset-2"
           >
             {t.checkAgain}
           </button>
         </div>
+      )}
+
+      {/* S8: offer continuity RIGHT AFTER the court date is confirmed (not only
+          at step 7) — a borrowed phone can vanish between sessions, so the most
+          valuable moment to save is the instant the date is locked in. Steps 2-6
+          only; the step-7 section renders its own instance, so there's no
+          double-up. Self-collapsing (starts closed), so the visual cost is low.
+          Requires a real caseId; when persistence is unavailable (S8) we skip it
+          and the non-blocking note explains why. */}
+      {step >= 2 && step < 7 && courtDateField?.confirmed && caseId && (
+        <ResumeByPhone
+          caseId={caseId}
+          strings={t}
+          onLinked={() => {
+            window.localStorage.setItem(CASE_ID_STORAGE_KEY, caseId);
+          }}
+          onSession={({ token }) => {
+            ownerSessionRef.current = token;
+          }}
+        />
       )}
 
       {/* ---------------- Step 1: Upload ---------------- */}
@@ -954,17 +1092,99 @@ export default function CopilotPage() {
             </label>
           </div>
 
+          {/* S2: icon-led framing tips. Static, localized, calm — they cut the
+              "unclear read" retry loop that costs a scared tenant precious days.
+              Hidden while reading so the spinner block is the focus. */}
+          {!intakeBusy && (
+            <ul className="space-y-1 text-sm text-trust-700">
+              <li>
+                <span aria-hidden="true">📄 </span>
+                {t.framingTipFlat}
+              </li>
+              <li>
+                <span aria-hidden="true">☀️ </span>
+                {t.framingTipLight}
+              </li>
+              <li>
+                <span aria-hidden="true">🔲 </span>
+                {t.framingTipWholePage}
+              </li>
+            </ul>
+          )}
+
           {/* Bot protection for the public intake action. Dev renders a no-op
               placeholder and emits a sentinel token so local dev still works. */}
-          <Turnstile onToken={setIntakeTurnstile} action="intake" />
+          <Turnstile token={intakeTurnstile} onToken={setIntakeTurnstile} action="intake" />
 
+          {/* S2: visible spinner + thumbnail + staged reassurance copy while the
+              10-30s+ OCR runs, so the step never reads as frozen. */}
           {intakeBusy && (
-            <p className="text-center text-sm text-trust-700" aria-live="polite">
-              {t.readingPapersHint}
+            <div className="flex items-center gap-3 rounded-lg border border-trust-200 bg-trust-50 px-3 py-3">
+              <div className="relative h-16 w-16 shrink-0">
+                {previewUrl && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={previewUrl}
+                    alt=""
+                    className="h-16 w-16 rounded-md object-cover opacity-70"
+                  />
+                )}
+                <div
+                  aria-hidden="true"
+                  className="absolute inset-0 flex items-center justify-center"
+                >
+                  <div className="h-7 w-7 animate-spin rounded-full border-2 border-trust-300 border-t-trust-600" />
+                </div>
+              </div>
+              <p className="text-sm text-trust-800" aria-live="polite">
+                {readingStage === 0
+                  ? t.readingPapersStage1
+                  : readingStage === 1
+                    ? t.readingPapersStage2
+                    : t.readingPapersStage3}
+              </p>
+            </div>
+          )}
+
+          {/* S2: forgiving retake — clear the preview and return to upload. Shown
+              when not busy and we have a preview (e.g. after an unclear read). */}
+          {!intakeBusy && previewUrl && (
+            <div className="flex items-center gap-3">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={previewUrl}
+                alt=""
+                className="max-h-40 rounded-md border border-trust-200"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  setPreviewUrl((prev) => {
+                    if (prev) URL.revokeObjectURL(prev);
+                    return null;
+                  });
+                  setStep(1);
+                }}
+                className="inline-flex min-h-[44px] shrink-0 items-center text-sm font-medium text-trust-700 underline underline-offset-2"
+              >
+                {t.retake}
+              </button>
+            </div>
+          )}
+
+          {/* S8: non-blocking continuity notes. Neither hard-fails the flow. */}
+          {storageBlocked && (
+            <p className="rounded-md bg-trust-50 px-3 py-2 text-sm text-trust-700">
+              {t.savingUnavailableBrowser}
+            </p>
+          )}
+          {persistUnavailable && (
+            <p className="rounded-md bg-trust-50 px-3 py-2 text-sm text-trust-700">
+              {t.savingUnavailable}
             </p>
           )}
 
-          <Disclaimer context={DisclaimerContext.General} variant="chip" />
+          <Disclaimer context={DisclaimerContext.General} variant="chip" strings={t} />
         </section>
       )}
 
@@ -980,10 +1200,18 @@ export default function CopilotPage() {
                 Try a clearer photo or PDF.{" "}
                 <button
                   type="button"
-                  className="font-medium text-trust-700 underline underline-offset-2"
-                  onClick={() => setStep(1)}
+                  className="inline-flex min-h-[44px] items-center font-medium text-trust-700 underline underline-offset-2"
+                  onClick={() => {
+                    // S2: forgiving retake — drop the prior preview so step 1
+                    // starts clean.
+                    setPreviewUrl((prev) => {
+                      if (prev) URL.revokeObjectURL(prev);
+                      return null;
+                    });
+                    setStep(1);
+                  }}
                 >
-                  Upload again
+                  {t.retake}
                 </button>
               </p>
             </div>
@@ -1035,7 +1263,7 @@ export default function CopilotPage() {
               />
             ))}
 
-          <Disclaimer context={DisclaimerContext.Deadline} variant="panel" />
+          <Disclaimer context={DisclaimerContext.Deadline} variant="panel" strings={t} />
 
           <NavButtons
             onBack={() => setStep(1)}
@@ -1057,7 +1285,7 @@ export default function CopilotPage() {
 
           {intake?.explanation?.summary && !intake.explanation.refused ? (
             <div className="space-y-2">
-              <Disclaimer context={DisclaimerContext.Chat} variant="chip" />
+              <Disclaimer context={DisclaimerContext.Chat} variant="chip" strings={t} />
               <div className="whitespace-pre-wrap rounded-lg border border-trust-200 bg-white px-4 py-3 text-sm leading-relaxed text-trust-900">
                 {intake.explanation.summary}
               </div>
@@ -1090,7 +1318,7 @@ export default function CopilotPage() {
                     </li>
                   ))}
               </ul>
-              <p className="text-xs text-trust-700">
+              <p className="text-sm text-trust-700">
                 Always trust your official court notice over anything shown here.
               </p>
             </div>
@@ -1153,7 +1381,11 @@ export default function CopilotPage() {
               review.advice_routed + the audit event (REVIEW fix #3). The client
               no longer PATCHes the review subtree back — it would be an untrusted
               writer of a safety signal. */}
-          <ChatPanel caseId={caseId ?? sessionId} caseObject={caseObject} />
+          <ChatPanel
+            caseId={caseId ?? sessionId}
+            caseObject={caseObject}
+            strings={t}
+          />
 
           {kbSources.length > 0 && (
             <div className="rounded-lg border border-trust-200 bg-trust-50 px-4 py-3">
@@ -1206,7 +1438,7 @@ export default function CopilotPage() {
             </div>
             {stipOpen && (
               <div className="mt-3">
-                <StipReview caseId={caseId ?? undefined} />
+                <StipReview caseId={caseId ?? undefined} strings={t} />
               </div>
             )}
           </div>
@@ -1223,7 +1455,14 @@ export default function CopilotPage() {
       {step === 5 && (
         <section className="space-y-4">
           <h2 className="text-lg">Possible issues to ask a lawyer about</h2>
-          <Disclaimer context={DisclaimerContext.Defense} variant="panel" />
+          <Disclaimer context={DisclaimerContext.Defense} variant="panel" strings={t} />
+
+          {/* Bot protection before the defenses lookup. The token drives the
+              load via an effect; dev emits a sentinel immediately. We only need
+              it until the checklist has loaded. */}
+          {!defenses && (
+            <Turnstile token={defensesTurnstile} onToken={setDefensesTurnstile} action="defenses" />
+          )}
 
           {defensesBusy && (
             <p className="text-sm text-trust-700" aria-live="polite">
@@ -1266,7 +1505,7 @@ export default function CopilotPage() {
               Whether any of these fit your case is a legal question.
             </p>
             <p className="mt-2">
-              <TalkToAPersonLink />
+              <TalkToAPersonLink strings={t} />
             </p>
           </div>
 
@@ -1282,7 +1521,7 @@ export default function CopilotPage() {
       {step === 6 && (
         <section className="space-y-4">
           <h2 className="text-lg">Your draft answer</h2>
-          <Disclaimer context={DisclaimerContext.AnswerDraft} variant="panel" />
+          <Disclaimer context={DisclaimerContext.AnswerDraft} variant="panel" strings={t} />
 
           {!answerLoaded && (
             <div className="space-y-2">
@@ -1303,10 +1542,13 @@ export default function CopilotPage() {
                 placeholder="Tell us what happened…"
                 className="w-full rounded-lg border border-trust-300 bg-white px-3 py-2 text-base leading-relaxed focus:border-trust-500 focus:outline-none focus:ring-2 focus:ring-trust-400"
               />
+              {/* Bot protection before the draft is authored. Dev emits a
+                  sentinel token immediately so local dev still works. */}
+              <Turnstile token={answerTurnstile} onToken={setAnswerTurnstile} action="answer" />
               <button
                 type="button"
                 onClick={buildDraft}
-                disabled={!narrative.trim() || answerBusy}
+                disabled={!narrative.trim() || answerBusy || answerTurnstile == null}
                 className="rounded-md bg-trust-600 px-4 py-2 text-sm font-semibold text-white hover:bg-trust-700 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {answerBusy ? "Writing your draft…" : "Make a draft"}
@@ -1324,12 +1566,10 @@ export default function CopilotPage() {
                 <div className="hcc-deadline rounded-lg text-sm">
                   <p className="font-semibold">
                     <span aria-hidden="true">🤝 </span>
-                    Some of what you wrote needs a person
+                    {t.answerRoutedHeading}
                   </p>
                   <p className="mt-1">
-                    Part of your note sounded like a question only a lawyer
-                    should answer, so we left it out of the draft and flagged it
-                    for the legal team. <TalkToAPersonLink />
+                    {t.answerRoutedBody} <TalkToAPersonLink strings={t} />
                   </p>
                 </div>
               )}
@@ -1375,7 +1615,7 @@ export default function CopilotPage() {
                 </p>
                 <p className="mt-1">
                   A lawyer can review it for free. We strongly recommend it.{" "}
-                  <TalkToAPersonLink />
+                  <TalkToAPersonLink strings={t} />
                 </p>
               </div>
             </div>
@@ -1499,6 +1739,7 @@ export default function CopilotPage() {
           {caseId && (
             <ResumeByPhone
               caseId={caseId}
+              strings={t}
               onLinked={() => {
                 window.localStorage.setItem(CASE_ID_STORAGE_KEY, caseId);
               }}
@@ -1512,12 +1753,12 @@ export default function CopilotPage() {
 
           <div className="rounded-lg border border-trust-200 bg-white px-4 py-3 text-sm">
             <p className="font-semibold text-trust-900">
-              {TALK_TO_A_PERSON_CTA.heading}
+              {t.talkToAPerson.heading}
             </p>
-            <p className="mt-1 text-trust-800">{TALK_TO_A_PERSON_CTA.body}</p>
+            <p className="mt-1 text-trust-800">{t.talkToAPerson.body}</p>
             <p className="mt-2 text-trust-800">
-              <strong>{TALK_TO_A_PERSON_CTA.hotlineName}:</strong>{" "}
-              {TALK_TO_A_PERSON_CTA.hotlineNote}
+              <strong>{t.talkToAPerson.hotlineName}:</strong>{" "}
+              {t.talkToAPerson.hotlineNote}
             </p>
             <a
               href={`tel:${TALK_TO_A_PERSON_CTA.hotlinePhone}`}
@@ -1664,13 +1905,40 @@ function caseToUiFields(c: Case): UiField[] {
   return out;
 }
 
-function StepHeader({ step }: { step: Step }) {
+function StepHeader({ step, strings }: { step: Step; strings: Strings }) {
   const steps: Step[] = [1, 2, 3, 4, 5, 6, 7];
+  const progress = formatStepProgress(strings, step, STEP_LABELS[step]);
+
+  // The persistent step title is the page's single <h1> (one per rendered step,
+  // no skipped heading levels — the per-step section <h2>s nest under it). On
+  // each step transition we move focus here and announce the new step, so a
+  // screen-reader / keyboard user lands on the heading that names where they are
+  // rather than being silently dropped at the top of the DOM (WCAG 2.4.3).
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+  // Mirror the heading into a polite live region (WCAG 4.1.3). The first render
+  // is not announced (live regions only fire on subsequent updates, and we don't
+  // want to steal focus on initial load), so we skip the focus move on mount too.
+  const [announcement, setAnnouncement] = useState("");
+  const didMount = useRef(false);
+
+  useEffect(() => {
+    // Skip the initial mount: don't steal focus on page load, and don't announce
+    // the first step (the live region starts empty so nothing is read on load).
+    if (!didMount.current) {
+      didMount.current = true;
+      return;
+    }
+    setAnnouncement(progress);
+    headingRef.current?.focus();
+    // Only re-run on step changes; `progress` is derived from `step`/language.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step]);
+
   return (
     <header className="space-y-2">
       <ol
         className="flex items-center gap-1.5"
-        aria-label={`Step ${step} of 7: ${STEP_LABELS[step]}`}
+        aria-label={progress}
       >
         {steps.map((s) => (
           <li
@@ -1687,8 +1955,16 @@ function StepHeader({ step }: { step: Step }) {
           />
         ))}
       </ol>
-      <p className="text-sm font-medium text-trust-700">
-        Step {step} of 7 — {STEP_LABELS[step]}
+      <h1
+        ref={headingRef}
+        tabIndex={-1}
+        className="text-sm font-medium text-trust-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-trust-400"
+      >
+        {progress}
+      </h1>
+      {/* Polite announcement of the active step for assistive tech. */}
+      <p aria-live="polite" className="sr-only">
+        {announcement}
       </p>
     </header>
   );

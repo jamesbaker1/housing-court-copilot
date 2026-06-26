@@ -37,12 +37,27 @@
  */
 import "server-only";
 
-/** The Case key paths that constitute the PII subtree sealed at rest. */
+/**
+ * The Case key paths that constitute the PII subtree sealed at rest.
+ *
+ * These are the top-level Case keys whose VALUES carry tenant-identifying or
+ * sensitive content. They are sealed as whole subtrees (JSON.stringify'd, then
+ * AES-GCM-encrypted). NOTE on what is deliberately NOT here:
+ *   - `court` stays plaintext: `court.court_date` is projected to a derived D1
+ *     column (for the reminder schedule + the retention-purge cron) which MUST
+ *     work without the key; the rest of `court` is low-sensitivity index/part.
+ *   - `status`/`deadlines`/`audit`/`ids` stay plaintext (non-PII structure).
+ * `property` (tenant home address) and `documents` (OCR'd court-paper text) ARE
+ * sealed — they are tenant-identifying and are not read from the doc without the
+ * key (derived columns come from the plaintext Case before sealing).
+ */
 export const PII_FIELD_PATHS = [
   "contact",
   "sensitive",
   "parties",
   "claimed_arrears",
+  "property",
+  "documents",
 ] as const;
 
 const ENC_PREFIX = '{"v":1,"alg":"A256GCM"';

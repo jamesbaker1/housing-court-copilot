@@ -15,7 +15,16 @@
 
 import { useState } from "react";
 import Disclaimer, { TalkToAPersonLink } from "@/components/Disclaimer";
+import Turnstile from "@/components/Turnstile";
 import { DisclaimerContext, TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
+import { fetchLlm } from "@/lib/fetch";
+import { downscaleImage } from "@/lib/image";
+import {
+  type Strings,
+  DEFAULT_LANGUAGE,
+  getStrings,
+  errorMessage,
+} from "@/lib/i18n";
 
 // ---------------------------------------------------------------------------
 // Wire types (mirror app/api/stipulation/route.ts response).
@@ -63,6 +72,12 @@ interface StipResponse {
 export interface StipReviewProps {
   /** Optional case_id to attach the review note / escalation to server-side. */
   caseId?: string;
+  /**
+   * Localized UI strings (M7). The copilot page passes its `t` so the upload
+   * error + retry hint are in the tenant's language. Falls back to English when
+   * used standalone.
+   */
+  strings?: Strings;
   className?: string;
 }
 
@@ -74,22 +89,12 @@ const ACCEPTED_TYPES = [
   "image/webp",
 ];
 
-// ---------------------------------------------------------------------------
-// File -> base64 (strip the data: URI prefix; the route tolerates it either way).
-// ---------------------------------------------------------------------------
-
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result);
-      const comma = result.indexOf(",");
-      resolve(comma >= 0 ? result.slice(comma + 1) : result);
-    };
-    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
-    reader.readAsDataURL(file);
-  });
-}
+/**
+ * Max base64 payload we'll POST (S3). ~6.5M base64 chars ≈ 4.8MB of binary —
+ * comfortably under typical Worker request-body limits. Mirrors the copilot
+ * intake guard; a client-side downscale normally keeps photos well under this.
+ */
+const MAX_B64 = 6_500_000;
 
 const CATEGORY_LABELS: Record<string, string> = {
   payment_amount: "Payment amount",
@@ -113,7 +118,13 @@ function categoryLabel(category: string): string {
 // Fixed product copy; not LLM-authored.
 // ---------------------------------------------------------------------------
 
-function DoNotSignBanner({ bindingNotice }: { bindingNotice: string }) {
+function DoNotSignBanner({
+  bindingNotice,
+  strings,
+}: {
+  bindingNotice: string;
+  strings?: Strings;
+}) {
   return (
     <div
       role="alert"
@@ -126,17 +137,25 @@ function DoNotSignBanner({ bindingNotice }: { bindingNotice: string }) {
       </p>
       <p className="mt-1 text-sm">{bindingNotice}</p>
       <p className="mt-2">
-        <TalkToAPersonLink />
+        <TalkToAPersonLink strings={strings} />
       </p>
     </div>
   );
 }
 
-export default function StipReview({ caseId, className = "" }: StipReviewProps) {
+export default function StipReview({
+  caseId,
+  strings,
+  className = "",
+}: StipReviewProps) {
+  const t = strings ?? getStrings(DEFAULT_LANGUAGE);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<StipResponse | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
+  // Bot protection for the public upload action (single-use; null until solved).
+  // The server fails closed in prod, so we gate the upload on having a token.
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
 
   async function handleFile(file: File) {
     setError(null);
@@ -144,22 +163,28 @@ export default function StipReview({ caseId, className = "" }: StipReviewProps) 
     setFileName(file.name);
 
     if (!ACCEPTED_TYPES.includes(file.type)) {
-      setError(
-        "Please upload a PDF or a clear photo (JPEG/PNG). Convert HEIC photos to JPEG first.",
-      );
+      setError(t.unsupportedFile);
       return;
     }
 
     setBusy(true);
     try {
-      const base64Data = await fileToBase64(file);
-      const res = await fetch("/api/stipulation", {
+      // S3: downscale + re-encode images (PDFs pass through untouched) before
+      // base64 — slow/metered uploads are the make-or-break first step.
+      const { data: base64Data, mediaType } = await downscaleImage(file);
+      // S3: friendly max-payload backstop (mirrors the copilot intake guard).
+      if (base64Data.length > MAX_B64) {
+        setError(t.fileTooLarge);
+        return;
+      }
+      const res = await fetchLlm("/api/stipulation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           base64Data,
-          mediaType: file.type,
+          mediaType,
           ...(caseId ? { case_id: caseId } : {}),
+          ...(turnstileToken ? { turnstileToken } : {}),
         }),
       });
       if (!res.ok) {
@@ -171,12 +196,18 @@ export default function StipReview({ caseId, className = "" }: StipReviewProps) 
       const payload = (await res.json()) as StipResponse;
       setData(payload);
     } catch (err) {
+      // Timeout/abort (lib/fetch) -> localized timeout copy; a server-provided
+      // error message is preserved; otherwise the localized generic fallback.
       setError(
-        err instanceof Error
-          ? err.message
-          : "Something went wrong reading that document. Please try again.",
+        errorMessage(
+          t,
+          err,
+          err instanceof Error ? err.message : t.stipulationError,
+        ),
       );
     } finally {
+      // The Turnstile token is single-use; force a re-solve before the next upload.
+      setTurnstileToken(null);
       setBusy(false);
     }
   }
@@ -199,7 +230,7 @@ export default function StipReview({ caseId, className = "" }: StipReviewProps) 
         className={[
           "flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-trust-300 bg-trust-50 px-4 py-8 text-center",
           "hover:bg-trust-100 focus-within:ring-2 focus-within:ring-trust-400",
-          busy ? "pointer-events-none opacity-60" : "",
+          busy || turnstileToken == null ? "pointer-events-none opacity-60" : "",
         ]
           .filter(Boolean)
           .join(" ")}
@@ -219,7 +250,7 @@ export default function StipReview({ caseId, className = "" }: StipReviewProps) 
           type="file"
           accept={ACCEPTED_TYPES.join(",")}
           className="sr-only"
-          disabled={busy}
+          disabled={busy || turnstileToken == null}
           onChange={(e) => {
             const f = e.target.files?.[0];
             if (f) void handleFile(f);
@@ -227,19 +258,38 @@ export default function StipReview({ caseId, className = "" }: StipReviewProps) 
         />
       </label>
 
+      {/* Bot protection before the upload. Dev renders a no-op placeholder and
+          emits a sentinel token so local dev still works. */}
+      <Turnstile token={turnstileToken} onToken={setTurnstileToken} action="stipulation" />
+
       {error && (
-        <p
+        <div
           role="alert"
-          className="rounded-md bg-deadline-50 px-3 py-2 text-sm text-deadline-700"
+          className="space-y-2 rounded-md bg-deadline-50 px-3 py-2 text-sm text-deadline-700"
         >
-          {error}
-        </p>
+          <p>{error}</p>
+          {/* Inline human handoff at the moment of failure (M7). */}
+          <p className="text-xs text-deadline-800">
+            <span className="font-medium">{t.needHelpNow}</span>{" "}
+            <TalkToAPersonLink strings={t} />
+          </p>
+          <div className="rounded-md bg-white/60 px-2 py-1.5 text-xs text-deadline-900">
+            <p className="font-medium">{t.talkToAPerson.hotlineName}</p>
+            <p className="mt-0.5">{t.talkToAPerson.hotlineNote}</p>
+            <a
+              href={`tel:${TALK_TO_A_PERSON_CTA.hotlinePhone}`}
+              className="mt-1 inline-block font-semibold text-trust-700 underline underline-offset-2"
+            >
+              Call {TALK_TO_A_PERSON_CTA.hotlinePhone}
+            </a>
+          </div>
+        </div>
       )}
 
       {data && (
         <div className="space-y-4">
           {/* Always-visible "do not sign" banner */}
-          <DoNotSignBanner bindingNotice={data.binding_notice} />
+          <DoNotSignBanner bindingNotice={data.binding_notice} strings={t} />
 
           {/* Could-not-review / route-to-human path */}
           {data.review === null ? (
@@ -327,7 +377,7 @@ export default function StipReview({ caseId, className = "" }: StipReviewProps) 
               </div>
 
               {/* Disclaimer that this is information, not advice */}
-              <Disclaimer context={DisclaimerContext.AnswerDraft} variant="panel" />
+              <Disclaimer context={DisclaimerContext.AnswerDraft} variant="panel" strings={t} />
             </>
           )}
 
@@ -355,7 +405,7 @@ export default function StipReview({ caseId, className = "" }: StipReviewProps) 
       {/* Static framing even before upload */}
       {!data && (
         <p className="text-xs text-trust-600">
-          A stipulation is a binding agreement. {TALK_TO_A_PERSON_CTA.hotlineNote}
+          A stipulation is a binding agreement. {t.talkToAPerson.hotlineNote}
         </p>
       )}
     </div>
