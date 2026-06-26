@@ -21,11 +21,12 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { CaseSchema } from "@/lib/case";
+import { CaseSchema, type Case } from "@/lib/case";
 import {
   buildHandoffPacket,
   checkHandoffConsent,
 } from "@/lib/handoff";
+import { evaluateEligibility } from "@/lib/eligibility";
 
 export const runtime = "nodejs";
 
@@ -66,14 +67,24 @@ export async function POST(req: Request): Promise<NextResponse> {
   }
   const input = parsed.data;
 
+  // Run the deterministic eligibility engine over the case so the attorney
+  // handoff summary always carries a current RTC / legal-aid / rental-assistance
+  // read (the engine FAILS SAFE — e.g. "insufficient_data: income not provided"
+  // is itself useful triage signal for the attorney). determined_by stays
+  // "deterministic" (Invariant #4) — never an LLM/tenant conclusion.
+  const eligibility = evaluateEligibility(input.case, {
+    now: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+  });
+  const caseWithEligibility: Case = { ...input.case, eligibility };
+
   // Consent pre-check (stub). Generation itself does not require consent per
   // API-CONTRACTS §3.14, but we surface the check so the client knows whether
   // delivery would be permitted. Delivery (not implemented in v1) re-checks.
-  const consent = checkHandoffConsent(input.case, {
+  const consent = checkHandoffConsent(caseWithEligibility, {
     providerId: input.provider_id,
   });
 
-  const result = buildHandoffPacket(input.case, {
+  const result = buildHandoffPacket(caseWithEligibility, {
     includeEvidenceIds: input.include_evidence_ids,
     intakeSummaryText: input.intake_summary_text ?? null,
     generatedByModel: input.generated_by_model ?? null,
@@ -103,6 +114,7 @@ export async function POST(req: Request): Promise<NextResponse> {
       packet: result.packet,
       plain_text: result.plainText,
       consent,
+      eligibility,
     },
     { status: 201 },
   );
