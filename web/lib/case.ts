@@ -344,6 +344,7 @@ export const ConsentDataCategorySchema = z.enum([
   "benefits_enrollment",
   "evidence",
 ]);
+export type ConsentDataCategory = z.infer<typeof ConsentDataCategorySchema>;
 
 /**
  * One record per recipient. Per-recipient, time-limited, severable, voluntary,

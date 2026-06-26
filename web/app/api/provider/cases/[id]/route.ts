@@ -29,18 +29,38 @@
 
 import { NextResponse } from "next/server";
 
-import type { Case, CaseStatus, StatusTransition, AttorneyReview } from "@/lib/case";
+import type { Case, Consent, AttorneyReview } from "@/lib/case";
 import { getCase, patchCase } from "@/lib/store";
 import { renderPlainTextSummary } from "@/lib/handoff";
 import { hasGrantedHandoffConsent } from "@/components/provider/TriageList";
+import {
+  projectCaseForProvider,
+  caseETag,
+  ifMatchSatisfied,
+  computeTriageTransition,
+  TRIAGE_ACTIONS,
+  type TriageAction,
+} from "@/lib/provider-redaction";
 
 export const runtime = "nodejs";
 
-type TriageAction = "accept" | "refer" | "decline";
-const ACTIONS: readonly TriageAction[] = ["accept", "refer", "decline"];
-
 function nowIso(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/** The granting handoff_to_provider consent (for its data_categories), or null. */
+function grantedHandoffConsent(c: Case, asOf: string): Consent | null {
+  const now = Date.parse(asOf);
+  return (
+    (c.consents ?? []).find(
+      (cn) =>
+        cn.scope === "handoff_to_provider" &&
+        cn.recipient.recipient_type === "legal_aid_provider" &&
+        cn.granted &&
+        !(cn.revoked_at && Date.parse(cn.revoked_at) <= now) &&
+        !(cn.expires_at && Date.parse(cn.expires_at) <= now),
+    ) ?? null
+  );
 }
 
 export async function GET(
@@ -55,7 +75,8 @@ export async function GET(
       { status: 404 },
     );
   }
-  if (!hasGrantedHandoffConsent(found)) {
+  const consent = grantedHandoffConsent(found, nowIso());
+  if (!consent) {
     return NextResponse.json(
       {
         error: "consent_required",
@@ -65,7 +86,28 @@ export async function GET(
       { status: 403 },
     );
   }
-  return NextResponse.json({ case: found, summary: renderPlainTextSummary(found) });
+
+  // REDACTION (§97): project the Case down to the consent's data_categories.
+  // Fields outside the consented categories are withheld; the case-facts summary
+  // is included only when case_facts is consented.
+  const { case: redacted, redacted_categories } = projectCaseForProvider(
+    found,
+    consent.data_categories,
+  );
+  const summary = consent.data_categories.includes("case_facts")
+    ? renderPlainTextSummary(found)
+    : null;
+
+  return NextResponse.json(
+    {
+      case: redacted,
+      summary,
+      consent_id: consent.consent_id,
+      data_categories: consent.data_categories,
+      redacted_categories,
+    },
+    { headers: { ETag: caseETag(found) } },
+  );
 }
 
 export async function POST(
@@ -90,10 +132,14 @@ export async function POST(
     );
   }
 
-  const { action, note } = body as { action?: unknown; note?: unknown };
-  if (typeof action !== "string" || !ACTIONS.includes(action as TriageAction)) {
+  const { action, note, attorney_confirmed } = body as {
+    action?: unknown;
+    note?: unknown;
+    attorney_confirmed?: unknown;
+  };
+  if (typeof action !== "string" || !TRIAGE_ACTIONS.includes(action as TriageAction)) {
     return NextResponse.json(
-      { error: "invalid_request", message: `action must be one of ${ACTIONS.join(", ")}.` },
+      { error: "invalid_request", message: `action must be one of ${TRIAGE_ACTIONS.join(", ")}.` },
       { status: 400 },
     );
   }
@@ -122,48 +168,42 @@ export async function POST(
     );
   }
 
-  const at = nowIso();
-  const actor = { actor_type: "provider" as const, actor_id: null };
-
-  // Compute the next review_state + (possibly) status transition.
-  let nextReviewState: AttorneyReview["review_state"];
-  let nextStatus: CaseStatus = current.status;
-  let transition: StatusTransition | null = null;
-
-  if (action === "accept") {
-    nextReviewState = "in_review";
-    // Move untransitioned cases forward to referred (the handoff is being taken
-    // up). Already-referred/represented cases keep their status.
-    if (current.status === "intake" || current.status === "prepared") {
-      nextStatus = "referred";
-      transition = {
-        from_status: current.status,
-        to_status: "referred",
-        at,
-        actor,
-        reason: note ?? "Provider accepted intake for review.",
-      };
-    }
-  } else if (action === "refer") {
-    nextReviewState = "escalated";
-    // Status is not regressed; a real onward re-route needs a fresh consent.
-  } else {
-    nextReviewState = "reviewed";
-    // Decline does not delete data and does not regress status.
+  // OPTIMISTIC CONCURRENCY (§3.3): if the client sent If-Match, it must match the
+  // current case version or the write is rejected (412) — prevents a triage
+  // action from clobbering a concurrent update it never saw.
+  if (!ifMatchSatisfied(req.headers.get("if-match"), current)) {
+    return NextResponse.json(
+      {
+        error: "precondition_failed",
+        message: "The case changed since you last read it. Re-fetch and retry.",
+        etag: caseETag(current),
+      },
+      { status: 412 },
+    );
   }
+
+  const at = nowIso();
+
+  // State machine (§4.4): accept advances intake/prepared → referred and
+  // referred → represented (attorney-gated); refer escalates; decline reviews.
+  const step = computeTriageTransition(current, action as TriageAction, {
+    now: at,
+    note: typeof note === "string" ? note : null,
+    attorneyConfirmed: attorney_confirmed === true,
+  });
 
   const review: AttorneyReview = {
     assigned_attorney_id: current.review?.assigned_attorney_id ?? null,
     advice_routed: current.review?.advice_routed ?? false,
     advice_detection_log: current.review?.advice_detection_log ?? [],
     triage_score: current.review?.triage_score ?? null,
-    review_state: nextReviewState,
+    review_state: step.nextReviewState,
   };
 
   const patch: Partial<Case> = {
-    status: nextStatus,
-    status_history: transition
-      ? [...current.status_history, transition]
+    status: step.nextStatus,
+    status_history: step.transition
+      ? [...current.status_history, step.transition]
       : current.status_history,
     review,
   };
@@ -187,10 +227,16 @@ export async function POST(
     );
   }
 
-  return NextResponse.json({
-    case: updated,
-    action,
-    review_state: nextReviewState,
-    status: updated.status,
-  });
+  return NextResponse.json(
+    {
+      case: updated,
+      action,
+      review_state: step.nextReviewState,
+      status: updated.status,
+      // Surfaced when an attorney-only advance (referred → represented) was asked
+      // for without attorney proof: the review was recorded but status held.
+      refused: step.refused ?? null,
+    },
+    { headers: { ETag: caseETag(updated) } },
+  );
 }
