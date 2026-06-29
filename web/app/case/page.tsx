@@ -34,6 +34,10 @@ import ResumeByPhone from "@/components/ResumeByPhone";
 import { DisclaimerContext, TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
 import type { Case } from "@/lib/case";
 import {
+  tenantEligibilityRows,
+  eligibilitySummary,
+} from "@/lib/eligibility-display";
+import {
   type Language,
   DEFAULT_LANGUAGE,
   SUPPORTED_LANGUAGES,
@@ -248,6 +252,7 @@ export default function CaseHomePage() {
   const reviewState = review?.review_state ?? "unassigned";
 
   const scheduledReminders = reminders.filter((r) => r.state === "scheduled");
+  const eligibilityRows = tenantEligibilityRows(c.eligibility);
 
   // The single NEXT recommended action — a simple, honest priority ladder that
   // never advises on the merits, only on what to do next in the tool.
@@ -483,6 +488,35 @@ export default function CaseHomePage() {
               the official court system. Until then, rely on your court notice.
             </p>
           )}
+        </HubSection>
+
+        <HubSection
+          icon="✅"
+          title="What free help you may qualify for"
+          href="/copilot"
+          summary={eligibilitySummary(c.eligibility)}
+        >
+          {eligibilityRows.length > 0 ? (
+            <ul className="mt-2 space-y-1.5">
+              {eligibilityRows.map((row) => (
+                <li key={row.label} className="text-sm text-trust-800">
+                  <span aria-hidden="true">
+                    {row.tone === "positive" ? "✅ " : row.tone === "unavailable" ? "▫️ " : "•  "}
+                  </span>
+                  <strong>{row.label}:</strong> {row.status}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-2 text-sm text-trust-700">
+              We haven&apos;t checked what programs you may qualify for yet. A
+              lawyer can help you figure this out — it&apos;s free to ask.
+            </p>
+          )}
+          <p className="mt-2 text-xs text-trust-600">
+            This is general information, not a decision about your case. Only a
+            lawyer or the program can confirm what you qualify for.
+          </p>
         </HubSection>
 
         <HubSection

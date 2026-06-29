@@ -13,7 +13,6 @@
  */
 import type {
   Case,
-  Consent,
   ConsentDataCategory,
   CaseStatus,
   StatusTransition,

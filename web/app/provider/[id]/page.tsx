@@ -20,12 +20,19 @@
 import { use, useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 
-import type { Case } from "@/lib/case";
+import type { Case, ConsentDataCategory } from "@/lib/case";
 
 type LoadState =
   | { phase: "loading" }
   | { phase: "error"; status: number; message: string }
-  | { phase: "ready"; case: Case; summary: string };
+  | {
+      phase: "ready";
+      case: Case;
+      summary: string;
+      dataCategories: ConsentDataCategory[];
+      redactedCategories: ConsentDataCategory[];
+      etag: string | null;
+    };
 
 type Action = "accept" | "refer" | "decline";
 
@@ -64,6 +71,9 @@ export default function ProviderCaseDetailPage({
         phase: "ready",
         case: data.case as Case,
         summary: typeof data.summary === "string" ? data.summary : "",
+        dataCategories: Array.isArray(data.data_categories) ? data.data_categories : [],
+        redactedCategories: Array.isArray(data.redacted_categories) ? data.redacted_categories : [],
+        etag: res.headers.get("etag"),
       });
     } catch {
       setState({ phase: "error", status: 0, message: "Network error loading the intake." });
@@ -75,27 +85,51 @@ export default function ProviderCaseDetailPage({
   }, [load]);
 
   const runAction = useCallback(
-    async (action: Action) => {
+    async (action: Action, opts: { asAttorney?: boolean } = {}) => {
       setBusy(true);
       setActionResult(null);
       try {
+        const headers: Record<string, string> = { "content-type": "application/json" };
+        // Optimistic concurrency: send If-Match so a stale triage write is
+        // rejected (412) rather than clobbering a concurrent update.
+        const etag = state.phase === "ready" ? state.etag : null;
+        if (etag) headers["if-match"] = etag;
+
         const res = await fetch(`/api/provider/cases/${id}`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ action, note: note.trim() || undefined }),
+          headers,
+          body: JSON.stringify({
+            action,
+            note: note.trim() || undefined,
+            ...(opts.asAttorney ? { attorney_confirmed: true } : {}),
+          }),
         });
         const data = await res.json().catch(() => ({}));
+        if (res.status === 412) {
+          setActionResult(
+            "This intake changed since you opened it. Reloading the latest before you act…",
+          );
+          await load();
+          return;
+        }
         if (!res.ok) {
           setActionResult(`Action failed: ${data?.message ?? res.statusText}`);
           return;
         }
+        const refusedNote =
+          data.refused === "represented_requires_attorney"
+            ? " (Status held — moving to represented requires an attorney; use “Accept as attorney”.)"
+            : "";
         setActionResult(
-          `${ACTION_LABEL[action]} recorded. Status: ${data.status}; review: ${data.review_state}.`,
+          `${ACTION_LABEL[action]} recorded. Status: ${data.status}; review: ${data.review_state}.${refusedNote}`,
         );
         setState((prev) => ({
           phase: "ready",
           case: data.case as Case,
           summary: prev.phase === "ready" ? prev.summary : "",
+          dataCategories: prev.phase === "ready" ? prev.dataCategories : [],
+          redactedCategories: prev.phase === "ready" ? prev.redactedCategories : [],
+          etag: res.headers.get("etag"),
         }));
       } catch {
         setActionResult("Network error applying the action.");
@@ -103,7 +137,7 @@ export default function ProviderCaseDetailPage({
         setBusy(false);
       }
     },
-    [id, note],
+    [id, note, state, load],
   );
 
   return (
@@ -153,6 +187,8 @@ export default function ProviderCaseDetailPage({
         <ReadyDetail
           c={state.case}
           summary={state.summary}
+          dataCategories={state.dataCategories}
+          redactedCategories={state.redactedCategories}
           note={note}
           setNote={setNote}
           busy={busy}
@@ -167,6 +203,8 @@ export default function ProviderCaseDetailPage({
 function ReadyDetail({
   c,
   summary,
+  dataCategories,
+  redactedCategories,
   note,
   setNote,
   busy,
@@ -175,11 +213,13 @@ function ReadyDetail({
 }: {
   c: Case;
   summary: string;
+  dataCategories: ConsentDataCategory[];
+  redactedCategories: ConsentDataCategory[];
   note: string;
   setNote: (v: string) => void;
   busy: boolean;
   actionResult: string | null;
-  runAction: (a: Action) => void;
+  runAction: (a: Action, opts?: { asAttorney?: boolean }) => void;
 }) {
   const confirmedFields = [
     c.court?.court_date && "court date",
@@ -192,9 +232,29 @@ function ReadyDetail({
   ].filter(Boolean) as string[];
 
   const packetReady = ["prepared", "referred", "represented"].includes(c.status);
+  // The attorney advance (referred → represented) is the only gated transition.
+  const canTakeAsAttorney = c.status === "referred";
 
   return (
     <div className="space-y-6">
+      {/* Consent-scope disclosure — what this consent permits you to see. */}
+      <section className="rounded-lg border border-trust-200 bg-white p-3 text-sm">
+        <h2 className="text-sm font-semibold text-gray-900">Data shared under this consent</h2>
+        <p className="mt-1 text-gray-700">
+          Shared:{" "}
+          <span className="font-medium">
+            {dataCategories.length > 0 ? dataCategories.join(", ") : "none"}
+          </span>
+        </p>
+        {redactedCategories.length > 0 && (
+          <p className="mt-1 text-amber-800">
+            Withheld (not consented):{" "}
+            <span className="font-medium">{redactedCategories.join(", ")}</span>. Ask
+            the tenant to extend consent if you need these to assist.
+          </p>
+        )}
+      </section>
+
       {/* Snapshot */}
       <section className="rounded-lg border border-gray-200 bg-white p-4">
         <h2 className="text-lg font-semibold text-gray-900">Snapshot</h2>
@@ -343,13 +403,24 @@ function ReadyDetail({
           >
             {ACTION_LABEL.decline}
           </button>
+          {canTakeAsAttorney && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => runAction("accept", { asAttorney: true })}
+              className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
+            >
+              Accept as attorney (represent)
+            </button>
+          )}
         </div>
         <p className="mt-2 text-xs text-gray-500">
           Accept moves an untransitioned case to <strong>referred</strong> and
-          sets review to <strong>in_review</strong>. Refer escalates for
-          supervising review (a real onward re-route needs a fresh consent).
-          Decline records a review without deleting data. Triage scores never
-          auto-decide.
+          sets review to <strong>in_review</strong>. Advancing a referred case to{" "}
+          <strong>represented</strong> is the attorney advice-line step — use{" "}
+          <strong>Accept as attorney</strong>. Refer escalates for supervising
+          review (a real onward re-route needs a fresh consent). Decline records a
+          review without deleting data. Triage scores never auto-decide.
         </p>
         {actionResult && (
           <p className="mt-2 rounded bg-white p-2 text-sm text-gray-800">{actionResult}</p>
