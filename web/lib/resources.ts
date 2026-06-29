@@ -22,6 +22,8 @@ export type ResourceCategory =
   | "hotline" // phone-first intake / triage line
   | "right_to_counsel" // City-funded RTC eviction representation intake
   | "legal_aid" // free legal services / self-help legal information
+  | "tenant_rights" // tenant-rights advice line (pro se info, not representation)
+  | "emergency_rent" // emergency rent / rental-assistance program intake
   | "court_help_center"; // in-courthouse Help Center (pro se assistance)
 
 export interface HelpResource {
@@ -79,6 +81,59 @@ export const HELP_RESOURCES: HelpResource[] = [
     url: "https://www.righttocounselnyc.org/",
     boroughs: [],
   },
+  // Added 2026-06 from research vetting. Source: housingcourtanswers.org/contact-us.
+  // Real pro-se hotline (Mon–Fri). Re-verify number before launch.
+  {
+    id: "housing-court-answers",
+    name: "Housing Court Answers",
+    category: "tenant_rights",
+    description:
+      "Free hotline (Monday–Friday) that explains how Housing Court works, what you " +
+      "owe, and where to get legal help — for tenants who don't have a lawyer.",
+    phone: "(212) 962-4795",
+    url: "https://housingcourtanswers.org/",
+    boroughs: [],
+  },
+  // Added 2026-06 from research vetting. Source:
+  // metcouncilonhousing.org/program/tenants-rights-hotline. Hours vary
+  // (volunteer-staffed) — call to confirm the day's hours. Re-verify before launch.
+  {
+    id: "met-council-tenants-rights-hotline",
+    name: "Met Council on Housing — Tenants' Rights Hotline",
+    category: "tenant_rights",
+    description:
+      "Free tenant-rights hotline staffed by trained advocates. Call with questions " +
+      "about rent, repairs, and eviction. Hours change, so call to check the day's hours.",
+    phone: "(212) 979-0611",
+    url: "https://www.metcouncilonhousing.org/program/tenants-rights-hotline/",
+    boroughs: [],
+  },
+  // Added 2026-06 from research vetting. Source: legalaidnyc.org/get-help/housing-problems.
+  // Main intake line routes to borough offices. Re-verify before launch.
+  {
+    id: "legal-aid-society-housing",
+    name: "The Legal Aid Society — Housing Help",
+    category: "legal_aid",
+    description:
+      "NYC's largest legal-aid group. Free legal help for low-income tenants facing " +
+      "eviction. This line connects you to the office for your borough.",
+    phone: "(212) 577-3300",
+    url: "https://legalaidnyc.org/get-help/housing-problems/",
+    boroughs: [],
+  },
+  // Added 2026-06 from research vetting. Source:
+  // legalservicesnyc.org/resources/housing-what-are-my-tenant-rights. Re-verify before launch.
+  {
+    id: "legal-services-nyc",
+    name: "Legal Services NYC",
+    category: "legal_aid",
+    description:
+      "Free legal help for low-income New Yorkers on housing and eviction. " +
+      "Multilingual staff — ask about getting a lawyer for your case.",
+    phone: "(917) 661-4500",
+    url: "https://www.legalservicesnyc.org/resources/housing-what-are-my-tenant-rights/",
+    boroughs: [],
+  },
   {
     id: "lawhelpny",
     name: "LawHelpNY",
@@ -90,6 +145,34 @@ export const HELP_RESOURCES: HelpResource[] = [
     url: "https://www.lawhelpny.org/",
     boroughs: [],
   },
+  // Added 2026-06 from research vetting. Source: access.nyc.gov/programs/one-shot-deal.
+  // Phone is the HRA Infoline (718-557-1399). Eligibility is never a conclusion here
+  // (§8.7) — copy uses "you may qualify." Re-verify before launch.
+  {
+    id: "hra-one-shot-deal",
+    name: "NYC Emergency Rent Help (One-Shot Deal)",
+    category: "emergency_rent",
+    description:
+      "NYC emergency cash help that can pay back rent to stop an eviction. Open to " +
+      "tenants regardless of immigration status — you may qualify; ask to find out.",
+    phone: "(718) 557-1399",
+    url: "https://access.nyc.gov/programs/one-shot-deal/",
+    boroughs: [],
+  },
+  // Added 2026-06 from research vetting. Official program page:
+  // nyc.gov/site/hra/help/cityfheps.page. Phone is the HRA Infoline (718-557-1399).
+  // Eligibility framed as "may qualify" (§8.7). Re-verify before launch.
+  {
+    id: "nyc-cityfheps",
+    name: "CityFHEPS Rent Voucher",
+    category: "emergency_rent",
+    description:
+      "NYC rent-help voucher that can pay part of your rent if you're at risk of " +
+      "losing your home. The rules are strict — ask whether you might qualify.",
+    phone: "(718) 557-1399",
+    url: "https://www.nyc.gov/site/hra/help/cityfheps.page",
+    boroughs: [],
+  },
   {
     id: "help-center-manhattan",
     name: "Manhattan Housing Court Help Center",
@@ -97,7 +180,10 @@ export const HELP_RESOURCES: HelpResource[] = [
     description:
       "In-courthouse Help Center for tenants without a lawyer — forms, filing, and " +
       "what-to-expect guidance. 111 Centre Street, New York, NY.",
-    phone: "(646) 386-5500",
+    // Phone corrected 2026-06 (was (646) 386-5500, stale). Verified against
+    // NY Courts NY County Housing Court directory; current line is 646-386-5554
+    // (also 646-386-5555). Re-verify before launch.
+    phone: "(646) 386-5554",
     url: "https://www.nycourts.gov/courts/nyc/housing/index.shtml",
     boroughs: ["manhattan"],
   },
@@ -108,7 +194,9 @@ export const HELP_RESOURCES: HelpResource[] = [
     description:
       "In-courthouse Help Center for pro se tenants — forms, filing, and guidance. " +
       "1118 Grand Concourse, Bronx, NY.",
-    phone: "(718) 466-3000",
+    // Phone corrected 2026-06 (was (718) 466-3000, stale). Verified against
+    // NY Courts Bronx County Housing Court directory. Re-verify before launch.
+    phone: "(718) 466-3025",
     url: "https://www.nycourts.gov/courts/nyc/housing/index.shtml",
     boroughs: ["bronx"],
   },
@@ -130,7 +218,10 @@ export const HELP_RESOURCES: HelpResource[] = [
     description:
       "In-courthouse Help Center for pro se tenants — forms, filing, and guidance. " +
       "89-17 Sutphin Boulevard, Jamaica, NY.",
-    phone: "(718) 262-7100",
+    // Phone corrected 2026-06 (was (718) 262-7100, stale). Verified against
+    // NY Courts Queens County Housing Court directory; current line is
+    // 718-262-7185 (also 718-262-7186). Re-verify before launch.
+    phone: "(718) 262-7185",
     url: "https://www.nycourts.gov/courts/nyc/housing/index.shtml",
     boroughs: ["queens"],
   },

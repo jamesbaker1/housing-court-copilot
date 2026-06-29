@@ -29,6 +29,8 @@ const CATEGORY_LABEL: Record<ResourceCategory, string> = {
   hotline: "Phone help",
   right_to_counsel: "Right to Counsel",
   legal_aid: "Free legal aid",
+  tenant_rights: "Tenant-rights hotline",
+  emergency_rent: "Rent money help",
   court_help_center: "Court Help Center",
 };
 
