@@ -34,8 +34,16 @@ export const {
   BucketCachePurge,
 } = openNextExports as Record<string, unknown>;
 
+/** Minimal R2 surface the cron uses to purge a deleted case's evidence prefix. */
+interface CronR2Bucket {
+  list(opts?: { prefix?: string }): Promise<{ objects: { key: string }[] }>;
+  delete(key: string | string[]): Promise<void>;
+}
+
 interface CronEnv {
   DB?: unknown;
+  /** Evidence blob store — purged in lockstep with the D1 retention purge. */
+  EVIDENCE_BUCKET?: CronR2Bucket;
   /** Ops/attorney gate forwarded to the court-source connector (see wrangler.toml). */
   COURT_DATA_VENDOR_AUTHORITATIVE?: string;
   /**
@@ -143,6 +151,33 @@ export default {
           );
           ctx.waitUntil(pingPurgeHealthcheck(env.HEALTHCHECK_PURGE_URL, false));
           return;
+        }
+        // Purge the R2 evidence blobs for every case that was just deleted, so
+        // tenant PII bytes don't outlive the case row. Raw binding (this handler
+        // is outside the Next request context, so the server-only lib can't be
+        // used here); content-addressed keys live under evidence/<case_id>/.
+        // Best-effort: a per-case failure is logged, never thrown.
+        if (env.EVIDENCE_BUCKET && report.purgedCaseIds.length > 0) {
+          ctx.waitUntil(
+            (async () => {
+              let blobs = 0;
+              for (const caseId of report.purgedCaseIds) {
+                try {
+                  const { objects } = await env.EVIDENCE_BUCKET!.list({
+                    prefix: `evidence/${caseId}/`,
+                  });
+                  const keys = objects.map((o) => o.key);
+                  if (keys.length > 0) {
+                    await env.EVIDENCE_BUCKET!.delete(keys);
+                    blobs += keys.length;
+                  }
+                } catch (err) {
+                  console.error(`[cron] evidence purge failed for a case:`, err);
+                }
+              }
+              if (blobs > 0) console.log(`[cron] evidence blobs purged=${blobs}`);
+            })(),
+          );
         }
         // PII-free operational log line.
         console.log(

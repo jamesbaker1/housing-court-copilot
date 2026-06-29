@@ -38,6 +38,19 @@ database_name = "housing-court-copilot"
 database_id = "6a4c1609-d91d-4aa2-9f86-4bd37cade15f"
 migrations_dir = "migrations"
 
+# Cloudflare R2 — the evidence blob store (ROADMAP Tier-2 #10). lib/evidence-
+# storage.ts reads this binding via getCloudflareContext().env.EVIDENCE_BUCKET;
+# with no binding it degrades to "unavailable" and the app keeps its no-blob flow
+# (uploads return 503, reads 503) — nothing breaks pre-provisioning. Bytes are
+# content-addressed + case-namespaced (evidence/<case_id>/<sha256>), tagged with
+# retention metadata, and purged on tenant-delete + by the retention cron.
+#
+# OPERATOR MUST PROVISION: `wrangler r2 bucket create housing-court-copilot-evidence`
+# then keep the binding below. Local (miniflare) mode simulates R2 with no account.
+[[r2_buckets]]
+binding = "EVIDENCE_BUCKET"
+bucket_name = "housing-court-copilot-evidence"
+
 # --- Cron Trigger: PII retention purge (REVIEW fix #5) ---------------------
 # Runs the deterministic retention purge daily at 07:10 UTC (~03:10 ET). The
 # handler (worker-entry.ts `scheduled`) deletes closed/inactive cases past their

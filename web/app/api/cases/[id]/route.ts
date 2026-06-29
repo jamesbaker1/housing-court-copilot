@@ -30,6 +30,7 @@ import {
   revokeCaseTokens,
   revokeCaseOwnerBindings,
 } from "@/lib/auth/session";
+import { purgeCaseEvidence } from "@/lib/evidence-storage";
 
 export const runtime = "nodejs";
 
@@ -146,6 +147,9 @@ export async function DELETE(
   // reuse of this case_id) can resurrect access. Best-effort; never throws.
   await revokeCaseTokens(id);
   await revokeCaseOwnerBindings(id);
+  // Purge the tenant's evidence blobs from R2 too (no-op when R2 is unbound), so
+  // a delete leaves no orphaned PII bytes behind. Best-effort; never throws.
+  await purgeCaseEvidence(id);
 
   if (!existed) {
     return NextResponse.json(
