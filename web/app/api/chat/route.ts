@@ -347,9 +347,11 @@ export async function POST(req: NextRequest): Promise<Response> {
   // global cap doesn't mask cheaper rejections; denies (and never consumes) when
   // the breaker is tripped OR the meter is unreadable (caps total Anthropic spend).
   if (!(await checkLlmGlobalLimit())) {
+    // 503 (not 429): this is a SERVICE-side budget ceiling, not a per-client rate
+    // limit. Uniform across all LLM routes so clients handle it consistently.
     return Response.json(
-      { error: "rate_limited", message: "Service is temporarily at capacity. Please try again later." },
-      { status: 429 },
+      { error: "at_capacity", message: "Service is temporarily at capacity. Please try again later." },
+      { status: 503 },
     );
   }
 

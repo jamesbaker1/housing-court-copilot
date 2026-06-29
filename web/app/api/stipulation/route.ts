@@ -167,9 +167,10 @@ export async function POST(request: Request): Promise<Response> {
   // (expensive vision) Anthropic call. After the per-IP limiter + Turnstile;
   // denies (and never consumes) when tripped OR the meter is unreadable.
   if (!(await checkLlmGlobalLimit())) {
+    // 503 (not 429): a SERVICE-side budget ceiling, uniform across LLM routes.
     return NextResponse.json(
-      { error: "rate_limited", message: "Service is temporarily at capacity. Please try again later." },
-      { status: 429 },
+      { error: "at_capacity", message: "Service is temporarily at capacity. Please try again later." },
+      { status: 503 },
     );
   }
 

@@ -1830,6 +1830,7 @@ function fieldToCasePatch(
   // sibling fields the tenant already confirmed (the store replaces sub-objects).
   const court = { ...(current?.court ?? {}), court_date_verified: false };
   const landlord = { ...(current?.parties?.landlord ?? {}) };
+  const tenant = { ...(current?.parties?.tenant ?? {}) };
   const property = { ...(current?.property ?? {}) };
 
   switch (key) {
@@ -1859,10 +1860,30 @@ function fieldToCasePatch(
     }
     case "landlord_name":
       return { parties: { ...current?.parties, landlord: { ...landlord, name: display } } };
+    case "petitioner_name":
+      // The petitioner is the suing party (the landlord/owner in nonpayment).
+      // Record it on the landlord party + flag is_petitioner, without clobbering a
+      // separately-confirmed landlord/owner name.
+      return {
+        parties: {
+          ...current?.parties,
+          landlord: { ...landlord, name: landlord.name ?? display, is_petitioner: true },
+        },
+      };
+    case "respondent_name":
+      // The respondent is the tenant being sued — their name on the papers.
+      return {
+        parties: {
+          ...current?.parties,
+          tenant: { ...tenant, name: display, is_respondent: true },
+        },
+      };
     case "premises_address":
       return {
-        property: { ...property, address: { line1: display } },
+        property: { ...property, address: { ...(property.address ?? {}), line1: display } },
       };
+    case "apartment_unit":
+      return { property: { ...property, apartment_unit: display } };
     case "case_type": {
       const ct = display.trim().toLowerCase() as CaseType;
       return { case_type: ct, case_type_confirmed: true };
@@ -1898,7 +1919,9 @@ function caseToUiFields(c: Case): UiField[] {
   if (c.court?.borough) push("borough", c.court.borough);
   if (c.claimed_arrears) push("claimed_arrears", c.claimed_arrears);
   if (c.parties?.landlord?.name) push("landlord_name", c.parties.landlord.name);
+  if (c.parties?.tenant?.name) push("respondent_name", c.parties.tenant.name);
   if (c.property?.address) push("premises_address", c.property.address);
+  if (c.property?.apartment_unit) push("apartment_unit", c.property.apartment_unit);
 
   // Preserve display order from FIELD_ORDER.
   out.sort((a, b) => FIELD_ORDER.indexOf(a.key) - FIELD_ORDER.indexOf(b.key));

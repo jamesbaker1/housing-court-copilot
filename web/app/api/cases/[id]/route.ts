@@ -31,6 +31,19 @@ import {
   revokeCaseOwnerBindings,
 } from "@/lib/auth/session";
 import { purgeCaseEvidence } from "@/lib/evidence-storage";
+import { limitPublicApi } from "@/lib/ratelimit";
+
+/** Per-IP rate limit shared by the case CRUD verbs (abuse-by-authorized-token). */
+async function rateLimited(req: Request, action: string): Promise<NextResponse | null> {
+  const limit = await limitPublicApi(req, `cases_${action}`);
+  if (!limit.allowed) {
+    return NextResponse.json(
+      { error: "rate_limited", message: "Too many requests. Please slow down." },
+      { status: 429 },
+    );
+  }
+  return null;
+}
 
 export const runtime = "nodejs";
 
@@ -58,6 +71,8 @@ export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string }> },
 ): Promise<NextResponse> {
+  const limited = await rateLimited(req, "get");
+  if (limited) return limited;
   const { id } = await params;
 
   const authz = await authorizeCaseAccess(id, readAccessContext(req));
@@ -77,6 +92,8 @@ export async function PATCH(
   req: Request,
   { params }: { params: Promise<{ id: string }> },
 ): Promise<NextResponse> {
+  const limited = await rateLimited(req, "patch");
+  if (limited) return limited;
   const { id } = await params;
 
   const authz = await authorizeCaseAccess(id, readAccessContext(req));
@@ -136,6 +153,8 @@ export async function DELETE(
   req: Request,
   { params }: { params: Promise<{ id: string }> },
 ): Promise<NextResponse> {
+  const limited = await rateLimited(req, "delete");
+  if (limited) return limited;
   const { id } = await params;
 
   const authz = await authorizeCaseAccess(id, readAccessContext(req));

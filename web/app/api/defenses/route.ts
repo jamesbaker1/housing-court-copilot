@@ -84,7 +84,7 @@ export async function POST(request: Request): Promise<NextResponse> {
   // (incl. the advice classifier) so a cost-DoS cannot run up unbounded spend.
   if (!(await checkLlmGlobalLimit())) {
     return NextResponse.json(
-      { error: "rate_limited", message: "Service is temporarily at capacity. Please try again later." },
+      { error: "at_capacity", message: "Service is temporarily at capacity. Please try again later." },
       { status: 503 },
     );
   }
