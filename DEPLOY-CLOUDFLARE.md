@@ -49,6 +49,33 @@ The migration below is **DONE and locally verified** (no account used). The numb
 steps after it are **YOURS** — they require `wrangler login` (a Cloudflare account/token)
 and are the only things left to go live.
 
+## Live deployment status (2026-06-29)
+
+The Worker **is deployed and live** on the `james.baker1628@gmail.com` account:
+
+- **URL:** https://housing-court-copilot.james-baker1628.workers.dev
+- **D1** `housing-court-copilot` — created **and migrated** (`0001`→`0004`, 9 tables).
+- **R2** `housing-court-copilot-evidence` — **created and bound** (evidence locker live).
+- **Cron** `10 7 * * *` (retention purge) — registered.
+- **Secret set:** `CASE_PII_KEY` (freshly generated 32-byte key). ⚠️ Rotating or
+  losing it orphans any field-encrypted PII — back it up before storing real data.
+- `/`, `/copilot` → 200; `/provider` → **403** (Access fails closed, as designed).
+
+**Remaining to be fully functional** (run `cd web && npm run preflight` to re-check):
+
+1. `ANTHROPIC_API_KEY` — **required**; every LLM surface (intake/chat/defenses/answer)
+   returns an error until set. `/api/health` reports it missing today.
+2. `TURNSTILE_SECRET_KEY` **and** the build-time `NEXT_PUBLIC_TURNSTILE_SITE_KEY` —
+   bot gate **fails closed in prod**, so the public LLM entry points are blocked until
+   both are set (the secret here + the public site key baked in at `next build`, then
+   redeploy).
+3. `CF_ACCESS_TEAM_DOMAIN` + `CF_ACCESS_AUD` + the Access application (step 5) — needed
+   to let real reviewers into `/provider` (it's locked, not exposed, until then).
+
+Set each with `wrangler secret put <NAME> --name housing-court-copilot`, then redeploy
+(`cd web && npm run deploy`). A `CASE_PII_KEY` rotation requires re-encrypting existing
+data — only safe now because the store is empty.
+
 ## Already done (local, verified green — nothing for you to do here)
 - `lib/store.ts` is dual-mode: **Cloudflare D1** when the `DB` binding is present
   (read via `getCloudflareContext`), **local file store** otherwise. Same interface
@@ -99,19 +126,34 @@ and are the only things left to go live.
    `0004_court_source.sql` on the real database (the last is the optional, additive
    court-date-sourcing acceleration table).
 
-4. **Set secrets** (these are prompted; values never go in the repo). `ANTHROPIC_API_KEY`
-   is required; the rest are optional per feature:
+4. **Set secrets** (prompted; values never go in the repo). Append
+   `--name housing-court-copilot` to each (or run from `web/` so `wrangler.toml` is
+   picked up). `CASE_PII_KEY`, `ANTHROPIC_API_KEY`, and the Turnstile pair are
+   required for a working app; the rest are optional per feature:
    ```bash
-   wrangler secret put ANTHROPIC_API_KEY      # required — the copilot LLM
-   wrangler secret put TWILIO_ACCOUNT_SID     # optional — live OTP/reminder SMS
-   wrangler secret put TWILIO_AUTH_TOKEN      # optional
-   wrangler secret put TWILIO_FROM            # optional — your Twilio sending number
-   wrangler secret put SOCRATA_APP_TOKEN      # optional — NYC open-data rate limits
-   wrangler secret put CF_ACCESS_TEAM_DOMAIN  # required to gate /provider (e.g. myteam.cloudflareaccess.com)
-   wrangler secret put CF_ACCESS_AUD          # required to gate /provider (the Access app Audience tag)
+   # PII encryption key (32 random bytes, base64). Generate + set in one shot:
+   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))" \
+     | wrangler secret put CASE_PII_KEY        # required — fails closed without it
+   wrangler secret put ANTHROPIC_API_KEY       # required — the copilot LLM
+   wrangler secret put TURNSTILE_SECRET_KEY    # required — bot gate FAILS CLOSED in prod
+   wrangler secret put TWILIO_ACCOUNT_SID      # optional — live OTP/reminder SMS
+   wrangler secret put TWILIO_AUTH_TOKEN       # optional
+   wrangler secret put TWILIO_FROM             # optional — your Twilio sending number
+   wrangler secret put SOCRATA_APP_TOKEN       # optional — NYC open-data rate limits
+   wrangler secret put CF_ACCESS_TEAM_DOMAIN   # required to gate /provider (e.g. myteam.cloudflareaccess.com)
+   wrangler secret put CF_ACCESS_AUD           # required to gate /provider (the Access app Audience tag)
    ```
+   `NEXT_PUBLIC_TURNSTILE_SITE_KEY` is **public** and build-time, not a secret — set it
+   in the build env before `next build` (e.g. `.env.production` / CI var) so the real
+   widget ships instead of the dev placeholder.
    If `TWILIO_*` are unset, SMS dry-runs (logs, never sends); the copilot still works.
    If `CF_ACCESS_*` are unset in production, `/provider` **fails closed** (403).
+
+   Re-check readiness any time (auth, D1 migrated, R2, which secrets are set):
+   ```bash
+   cd web && npm run preflight
+   ```
+   And apply migrations to the remote D1 with `npm run db:migrate:remote`.
 
 5. **Configure the Cloudflare Access application over `/provider`** (Zero Trust dashboard):
    - Zero Trust → Access → Applications → Add → **Self-hosted**.

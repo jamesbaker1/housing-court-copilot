@@ -25,6 +25,15 @@ compatibility_flags = ["nodejs_compat"]
 binding = "ASSETS"
 directory = ".open-next/assets"
 
+# `server-only` is a Next.js build-time marker (throws if pulled into a CLIENT
+# bundle). The OpenNext build handles it, but Wrangler bundles the ops
+# `worker-entry.ts` wrapper SEPARATELY, and that wrapper transitively imports the
+# marker via lib/retention -> lib/store -> lib/crypto-field. That code runs only
+# server-side here, so alias the marker to an empty no-op module so the wrapper
+# bundle resolves. (The real client/server guard still applies in the Next build.)
+[alias]
+"server-only" = "./server-only-shim.js"
+
 # Cloudflare D1 — the production Case store. The store (lib/store.ts) reads this
 # binding via getCloudflareContext().env.DB; with no binding it falls back to the
 # local file store. `database_name` is what `npm run db:migrate:local` targets.

@@ -13,7 +13,9 @@
     "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
     "deploy": "npm run typecheck && npm run test && opennextjs-cloudflare build && opennextjs-cloudflare deploy",
     "cf-typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts",
-    "db:migrate:local": "wrangler d1 migrations apply housing-court-copilot --local"
+    "preflight": "node scripts/preflight.mjs",
+    "db:migrate:local": "wrangler d1 migrations apply housing-court-copilot --local",
+    "db:migrate:remote": "wrangler d1 migrations apply housing-court-copilot --remote"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.69.0",
