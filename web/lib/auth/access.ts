@@ -26,8 +26,60 @@ export const ACCESS_JWT_HEADER = "cf-access-jwt-assertion";
 export const ACCESS_JWT_COOKIE = "CF_Authorization";
 
 export type AccessResult =
-  | { ok: true; email: string | null; sub: string | null; payload: JWTPayload }
+  | {
+      ok: true;
+      email: string | null;
+      sub: string | null;
+      /** Provider org id (consent.recipient.recipient_id), from a configured claim. */
+      prv: string | null;
+      /** Authorization roles (e.g. "provider_attorney"), from a configured claim. */
+      roles: string[];
+      payload: JWTPayload;
+    }
   | { ok: false; reason: string };
+
+/** Walk a dot-path (e.g. "custom.prv") into a JWT payload; undefined if absent. */
+function claimAt(payload: JWTPayload, path: string): unknown {
+  let cur: unknown = payload;
+  for (const part of path.split(".")) {
+    if (cur == null || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[part];
+  }
+  return cur;
+}
+
+/**
+ * Extract the provider org id (`prv`) from the verified payload. The claim name
+ * is IdP/Access-specific, so it's configurable via CF_ACCESS_PRV_CLAIM (a dot
+ * path), defaulting to a search of the common locations. Returns null if absent.
+ */
+export function extractPrv(payload: JWTPayload): string | null {
+  const configured = process.env.CF_ACCESS_PRV_CLAIM;
+  const paths = configured ? [configured] : ["prv", "custom.prv", "custom.prv_id"];
+  for (const p of paths) {
+    const v = claimAt(payload, p);
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+/**
+ * Extract authorization roles from the verified payload. Configurable via
+ * CF_ACCESS_ROLES_CLAIM (dot path), defaulting to common locations
+ * (roles / custom.roles / groups). Accepts a string[] or a comma/space string.
+ */
+export function extractRoles(payload: JWTPayload): string[] {
+  const configured = process.env.CF_ACCESS_ROLES_CLAIM;
+  const paths = configured ? [configured] : ["roles", "custom.roles", "groups"];
+  for (const p of paths) {
+    const v = claimAt(payload, p);
+    if (Array.isArray(v)) return v.filter((x): x is string => typeof x === "string");
+    if (typeof v === "string" && v.trim()) {
+      return v.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
 
 /**
  * Cache the remote JWKS key-getter keyed by team domain. jose's
@@ -104,7 +156,14 @@ export async function verifyAccessToken(
     const email =
       typeof payload.email === "string" ? payload.email : null;
     const sub = typeof payload.sub === "string" ? payload.sub : null;
-    return { ok: true, email, sub, payload };
+    return {
+      ok: true,
+      email,
+      sub,
+      prv: extractPrv(payload),
+      roles: extractRoles(payload),
+      payload,
+    };
   } catch (err) {
     const reason = err instanceof Error ? err.message : "verification failed";
     return { ok: false, reason };

@@ -22,22 +22,26 @@
 import { NextResponse } from "next/server";
 
 import { listCases, getCase } from "@/lib/store";
+import { toTriageRow, type TriageRow } from "@/components/provider/TriageList";
 import {
-  hasGrantedHandoffConsent,
-  toTriageRow,
-  type TriageRow,
-} from "@/components/provider/TriageList";
+  readProviderPrincipal,
+  hasVisibleHandoffConsent,
+} from "@/lib/auth/provider-principal";
 
 export const runtime = "nodejs";
 
-export async function GET(): Promise<NextResponse> {
+export async function GET(req: Request): Promise<NextResponse> {
+  // PER-PROVIDER SCOPING (§2.2): only rows whose handoff consent is addressed to
+  // THIS provider (or unscoped) are listed. prv comes from the verified Access
+  // token (forwarded by middleware as x-access-prv); null prv ⇒ no scoping.
+  const { prv } = readProviderPrincipal(req);
   const summaries = await listCases();
 
   const rows: TriageRow[] = [];
   for (const s of summaries) {
     const c = await getCase(s.case_id);
     if (!c) continue;
-    if (!hasGrantedHandoffConsent(c)) continue;
+    if (!hasVisibleHandoffConsent(c, prv)) continue;
     rows.push(toTriageRow(c));
   }
 

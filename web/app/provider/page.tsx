@@ -15,17 +15,19 @@
  * the requesting provider's `prv`. Treat this as an internal prototype only.
  */
 
+import { headers } from "next/headers";
+
 import { listConsentedCases, getCase } from "@/lib/store";
 import TriageList, {
-  hasGrantedHandoffConsent,
   toTriageRow,
   type TriageRow,
 } from "@/components/provider/TriageList";
+import { hasVisibleHandoffConsent } from "@/lib/auth/provider-principal";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-async function loadQueue(): Promise<TriageRow[]> {
+async function loadQueue(prv: string | null): Promise<TriageRow[]> {
   // PERF (S12): consent-filter at the SQL/index level (idx_cases_consent_court_date)
   // so we only getCase() the CONSENTED subset rather than full-reading every Case's
   // PII blob. toTriageRow needs the full Case, so each consented id is still read.
@@ -34,9 +36,10 @@ async function loadQueue(): Promise<TriageRow[]> {
   for (const s of summaries) {
     const c = await getCase(s.case_id);
     if (!c) continue;
-    // Defensive re-check (fail-closed): listConsentedCases() already filtered,
-    // but a consent could lapse between the list query and this read.
-    if (!hasGrantedHandoffConsent(c)) continue;
+    // PER-PROVIDER SCOPING (§2.2) + fail-closed re-check: only rows whose handoff
+    // consent is addressed to THIS provider (or unscoped) are shown. prv comes
+    // from the verified Access token (forwarded by middleware as x-access-prv).
+    if (!hasVisibleHandoffConsent(c, prv)) continue;
     rows.push(toTriageRow(c));
   }
   rows.sort((a, b) => {
@@ -51,7 +54,9 @@ async function loadQueue(): Promise<TriageRow[]> {
 }
 
 export default async function ProviderQueuePage() {
-  const rows = await loadQueue();
+  // The verified provider org id, forwarded by middleware from the Access JWT.
+  const prv = (await headers()).get("x-access-prv");
+  const rows = await loadQueue(prv && prv.trim() ? prv.trim() : null);
 
   return (
     <div className="space-y-6">
@@ -83,16 +88,15 @@ export default async function ProviderQueuePage() {
         </p>
       </div>
 
-      {/* Scope/redaction caveat, visible in-product. Access now gates the surface,
-          but per-provider scoping + data_categories redaction are still pending. */}
+      {/* Scope/redaction status, visible in-product. */}
       <div
         role="note"
-        className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800"
+        className="rounded-lg border border-trust-200 bg-trust-50 p-3 text-xs text-trust-800"
       >
-        <strong>Limited-access surface.</strong> Cloudflare Access gates this
-        console and the provider API. Per-provider consent scoping and
-        data_categories redaction are still pending — do not treat a listed
-        intake as scoped to your org yet.
+        <strong>Access-gated, consent-scoped surface.</strong> Cloudflare Access
+        gates this console; intakes are scoped to your organization (per-provider
+        consent) and each open case is redacted to the tenant&apos;s consented
+        data categories. The advice line (representing a tenant) is attorney-only.
       </div>
 
       <TriageList rows={rows} />

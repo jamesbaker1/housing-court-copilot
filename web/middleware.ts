@@ -57,6 +57,8 @@ function stripInboundIdentityHeaders(req: NextRequest): Headers {
   const headers = new Headers(req.headers);
   headers.delete("x-access-email");
   headers.delete("x-access-sub");
+  headers.delete("x-access-prv");
+  headers.delete("x-access-roles");
   return headers;
 }
 
@@ -132,10 +134,15 @@ export async function middleware(req: NextRequest): Promise<NextResponse> {
     return forbiddenResponse(req, result.reason);
   }
 
-  // Authenticated. Forward the provider identity downstream for audit; route
-  // handlers may read `x-access-email` instead of re-verifying the token. These
-  // are set ONLY from the verified token (the inbound copies were stripped above).
+  // Authenticated. Forward the provider identity + authorization claims
+  // downstream for audit AND enforcement (prv data-scoping, attorney-role gate).
+  // These are set ONLY from the verified token (inbound copies stripped above),
+  // so a route handler can trust them without re-verifying the JWT. A present
+  // (even empty) x-access-roles header is the signal that this is a verified
+  // Access context, which the route uses to switch from dev-fallback to enforce.
   if (result.email) safeHeaders.set("x-access-email", result.email);
   if (result.sub) safeHeaders.set("x-access-sub", result.sub);
+  if (result.prv) safeHeaders.set("x-access-prv", result.prv);
+  safeHeaders.set("x-access-roles", result.roles.join(","));
   return NextResponse.next({ request: { headers: safeHeaders } });
 }

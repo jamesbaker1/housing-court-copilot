@@ -32,7 +32,6 @@ import { NextResponse } from "next/server";
 import type { Case, Consent, AttorneyReview } from "@/lib/case";
 import { getCase, patchCase } from "@/lib/store";
 import { renderPlainTextSummary } from "@/lib/handoff";
-import { hasGrantedHandoffConsent } from "@/components/provider/TriageList";
 import {
   projectCaseForProvider,
   caseETag,
@@ -41,6 +40,12 @@ import {
   TRIAGE_ACTIONS,
   type TriageAction,
 } from "@/lib/provider-redaction";
+import {
+  readProviderPrincipal,
+  consentVisibleToPrv,
+  attorneyAdvanceAllowed,
+  type ProviderPrincipal,
+} from "@/lib/auth/provider-principal";
 
 export const runtime = "nodejs";
 
@@ -48,8 +53,16 @@ function nowIso(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-/** The granting handoff_to_provider consent (for its data_categories), or null. */
-function grantedHandoffConsent(c: Case, asOf: string): Consent | null {
+/**
+ * The granting handoff_to_provider consent VISIBLE to this provider (for its
+ * data_categories), or null. Applies per-provider scoping: a consent addressed
+ * to a DIFFERENT prv is not visible (§2.2). prv = null ⇒ no scoping (dev/single).
+ */
+function grantedHandoffConsent(
+  c: Case,
+  asOf: string,
+  prv: string | null,
+): Consent | null {
   const now = Date.parse(asOf);
   return (
     (c.consents ?? []).find(
@@ -58,16 +71,18 @@ function grantedHandoffConsent(c: Case, asOf: string): Consent | null {
         cn.recipient.recipient_type === "legal_aid_provider" &&
         cn.granted &&
         !(cn.revoked_at && Date.parse(cn.revoked_at) <= now) &&
-        !(cn.expires_at && Date.parse(cn.expires_at) <= now),
+        !(cn.expires_at && Date.parse(cn.expires_at) <= now) &&
+        consentVisibleToPrv(cn, prv),
     ) ?? null
   );
 }
 
 export async function GET(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ id: string }> },
 ): Promise<NextResponse> {
   const { id } = await params;
+  const { prv } = readProviderPrincipal(req);
   const found = await getCase(id);
   if (!found) {
     return NextResponse.json(
@@ -75,7 +90,7 @@ export async function GET(
       { status: 404 },
     );
   }
-  const consent = grantedHandoffConsent(found, nowIso());
+  const consent = grantedHandoffConsent(found, nowIso(), prv);
   if (!consent) {
     return NextResponse.json(
       {
@@ -115,6 +130,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ): Promise<NextResponse> {
   const { id } = await params;
+  const principal: ProviderPrincipal = readProviderPrincipal(req);
 
   let body: unknown;
   try {
@@ -157,12 +173,33 @@ export async function POST(
       { status: 404 },
     );
   }
-  if (!hasGrantedHandoffConsent(current)) {
+  // PER-PROVIDER SCOPING (§2.2): the consent must be addressed to this provider
+  // (or unscoped). A consent for a DIFFERENT prv is invisible — uniform 403.
+  if (!grantedHandoffConsent(current, nowIso(), principal.prv)) {
     return NextResponse.json(
       {
         error: "consent_required",
         message:
           "No granted handoff_to_provider consent for a legal-aid provider on this case.",
+      },
+      { status: 403 },
+    );
+  }
+
+  // ATTORNEY-ONLY ADVICE LINE (§2.2 / §99): advancing referred → represented is
+  // attorney-only. The gate fires ONLY when the caller actually ATTEMPTS the
+  // advance (attorney_confirmed=true) but lacks the role — a non-attorney may
+  // still accept a referred case to keep it in review (it just won't advance).
+  // In a verified Access context the provider_attorney role is REQUIRED; the
+  // client's attorney_confirmed flag alone is not trusted in prod.
+  const attemptingRepresent =
+    action === "accept" && current.status === "referred" && attorney_confirmed === true;
+  if (attemptingRepresent && !attorneyAdvanceAllowed(principal, true)) {
+    return NextResponse.json(
+      {
+        error: "attorney_role_required",
+        message:
+          "Advancing a referred case to represented requires the provider_attorney role.",
       },
       { status: 403 },
     );
@@ -189,7 +226,9 @@ export async function POST(
   const step = computeTriageTransition(current, action as TriageAction, {
     now: at,
     note: typeof note === "string" ? note : null,
-    attorneyConfirmed: attorney_confirmed === true,
+    // Server-decided: the advance happens only with both represent-intent AND
+    // attorney permission (role in prod / confirmed intent in dev).
+    attorneyConfirmed: attorneyAdvanceAllowed(principal, attorney_confirmed === true),
   });
 
   const review: AttorneyReview = {
