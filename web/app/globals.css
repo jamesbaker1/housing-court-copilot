@@ -13,26 +13,67 @@
   }
 
   body {
-    @apply bg-trust-50 text-trust-950 antialiased;
+    @apply text-trust-950 antialiased;
     min-height: 100dvh;
+    /* A soft, calming wash instead of a flat fill — depth without distraction.
+       Tinted teal at the top fading to near-white keeps long legal text readable. */
+    background: linear-gradient(180deg, #eaf6f7 0%, #f4fafb 32%, #fbfdfd 100%)
+      no-repeat;
+    background-attachment: fixed;
   }
 
-  /* Comfortable default reading width for long-form legal info on mobile. */
+  /* Comfortable, confident type rhythm for long-form legal info on mobile. */
   h1 {
     @apply text-2xl font-semibold tracking-tight text-trust-900;
+    line-height: 1.2;
   }
   h2 {
-    @apply text-xl font-semibold text-trust-900;
+    @apply text-xl font-semibold tracking-tight text-trust-900;
   }
   a {
     @apply text-trust-700 underline underline-offset-2;
+  }
+  /* A single, consistent focus ring across the app (keyboard users). */
+  :focus-visible {
+    @apply outline-none ring-2 ring-trust-400 ring-offset-2 ring-offset-trust-50;
   }
 }
 
 @layer components {
   /* The persistent "guide, not a lawyer" banner. A trust feature, not chrome. */
   .hcc-banner {
-    @apply sticky top-0 z-40 w-full border-b border-trust-200 bg-trust-100/95 px-4 py-2 text-sm text-trust-800 backdrop-blur;
+    @apply sticky top-0 z-40 w-full border-b border-trust-200/70 bg-trust-100/85 px-4 py-2 text-sm text-trust-800 backdrop-blur-md;
+  }
+
+  /* The standard surface: a calm white card with soft depth. */
+  .hcc-card {
+    @apply rounded-2xl border border-trust-100 bg-white/95 shadow-card;
+  }
+  /* A card that is itself a tap target — lifts gently on hover/focus. */
+  .hcc-card-link {
+    @apply hcc-card transition duration-200 hover:-translate-y-0.5 hover:border-trust-200 hover:shadow-card-hover;
+  }
+
+  /* Small uppercase "eyebrow" that introduces a group/section. */
+  .hcc-eyebrow {
+    @apply text-xs font-semibold uppercase tracking-wide text-trust-500;
+  }
+
+  /* Round tinted badge that holds an emoji/icon — gives icons a home. */
+  .hcc-icon-badge {
+    @apply inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-trust-100 text-xl leading-none text-trust-700;
+  }
+  .hcc-icon-badge-care {
+    @apply hcc-icon-badge bg-care-100 text-care-600;
+  }
+
+  /* Primary action — confident, warm depth, large tap target. */
+  .hcc-btn-primary {
+    @apply inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-trust-600 px-5 py-3 text-base font-semibold text-white no-underline shadow-cta transition duration-200 hover:-translate-y-0.5 hover:bg-trust-700 active:translate-y-0;
+  }
+  /* Secondary action — quiet, outlined. */
+  .hcc-btn-secondary {
+    @apply inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl border border-trust-300 bg-white px-4 py-2.5 text-sm font-medium text-trust-700 no-underline transition duration-200 hover:bg-trust-50;
   }
 
   /* Contextual "verify this / not legal advice" panel for LLM output. */
@@ -43,5 +84,21 @@
   /* The code-backed court-date / deadline backstop callout. */
   .hcc-deadline {
     @apply rounded-lg border border-deadline-200 bg-deadline-50 px-3 py-2 text-sm text-deadline-900;
+  }
+}
+
+/* Respect users who prefer less motion — disable the lift + entrance animations. */
+@media (prefers-reduced-motion: reduce) {
+  .hcc-card-link,
+  .hcc-btn-primary,
+  .hcc-btn-secondary {
+    transition: none;
+  }
+  .hcc-card-link:hover,
+  .hcc-btn-primary:hover {
+    transform: none;
+  }
+  .animate-fade-rise {
+    animation: none;
   }
 }

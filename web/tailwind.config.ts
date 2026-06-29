@@ -50,6 +50,18 @@ const config: Config = {
           700: "#b91c1c",
           900: "#7f1d1d",
         },
+        // Warm, human accent — used sparingly for hopeful / "you're cared for"
+        // touches (icon badges, the hero glow). Never a status color.
+        care: {
+          50: "#fff6ed",
+          100: "#ffe9d4",
+          200: "#fed0a8",
+          300: "#fdb070",
+          400: "#fb8b3c",
+          500: "#f96d16",
+          600: "#ea520c",
+          700: "#c23d0d",
+        },
       },
       fontFamily: {
         sans: [
@@ -61,6 +73,26 @@ const config: Config = {
           "Arial",
           "sans-serif",
         ],
+      },
+      // Soft, layered depth — calm cards that lift gently on interaction.
+      boxShadow: {
+        card: "0 1px 2px 0 rgb(12 36 41 / 0.04), 0 1px 3px 0 rgb(12 36 41 / 0.05)",
+        "card-hover":
+          "0 6px 16px -4px rgb(12 36 41 / 0.10), 0 3px 8px -3px rgb(12 36 41 / 0.07)",
+        cta: "0 10px 28px -8px rgb(37 109 119 / 0.5)",
+      },
+      borderRadius: {
+        "2xl": "1.125rem",
+        "3xl": "1.5rem",
+      },
+      keyframes: {
+        "fade-rise": {
+          "0%": { opacity: "0", transform: "translateY(6px)" },
+          "100%": { opacity: "1", transform: "translateY(0)" },
+        },
+      },
+      animation: {
+        "fade-rise": "fade-rise 0.4s ease-out both",
       },
     },
   },
