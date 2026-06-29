@@ -829,6 +829,44 @@ export const AttorneyReviewSchema = z.object({
 export type AttorneyReview = z.infer<typeof AttorneyReviewSchema>;
 
 // ---------------------------------------------------------------------------
+// Outcome (impact tracking) — server-recorded, anonymizable
+// ---------------------------------------------------------------------------
+
+/**
+ * Terminal case dispositions for impact measurement + funder reporting
+ * (ROADMAP #14). NOT a legal conclusion: this records WHAT HAPPENED to the case,
+ * recorded by a human/provider or deterministic signal — never an LLM guess and
+ * never advice. `unknown` is the honest default.
+ */
+export const OutcomeDispositionSchema = z.enum([
+  "default_avoided", // tenant appeared / answered in time; no default judgment
+  "answer_filed",
+  "represented", // a lawyer took the case
+  "dismissed",
+  "settled_stipulation",
+  "possession_judgment", // adverse: warrant / judgment of possession
+  "case_closed_other",
+  "unknown",
+]);
+export type OutcomeDisposition = z.infer<typeof OutcomeDispositionSchema>;
+
+export const OutcomeSchema = z.object({
+  disposition: OutcomeDispositionSchema,
+  /** Who recorded it (provider/system) — never the LLM. */
+  recorded_by: ActorSchema,
+  recorded_at: TimestampSchema,
+  /** Free-text provider note (optional); never furnished to a landlord. */
+  note: z.string().nullable().optional(),
+  /**
+   * True only when the tenant granted consent to include this (anonymized) in
+   * impact/funder reporting. Default-deny — absent consent, the outcome stays on
+   * the case but is never emitted to the aggregate metrics sink.
+   */
+  consented_to_report: z.boolean().default(false),
+});
+export type Outcome = z.infer<typeof OutcomeSchema>;
+
+// ---------------------------------------------------------------------------
 // Status transitions + audit
 // ---------------------------------------------------------------------------
 
@@ -906,6 +944,8 @@ export const CaseSchema = z.object({
   reminders: z.array(ReminderSchema).default([]),
 
   review: AttorneyReviewSchema.optional(),
+  /** Terminal disposition for impact tracking (server-recorded; see OutcomeSchema). */
+  outcome: OutcomeSchema.optional(),
 
   created_at: TimestampSchema,
   updated_at: TimestampSchema,
@@ -1013,6 +1053,10 @@ export function stripSafetyOwnedFields(
     }
     out.answer_draft = ad;
   }
+
+  // outcome — the terminal disposition is recorded server-side by a provider /
+  // deterministic signal, never by a tenant PATCH (it feeds impact reporting).
+  delete out.outcome;
 
   return out;
 }
