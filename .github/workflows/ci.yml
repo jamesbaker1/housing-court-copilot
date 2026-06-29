@@ -1,0 +1,68 @@
+# CI — gates every push + PR before the deploy path can run.
+# Mirrors the local deploy preconditions: typecheck (both tsconfigs) -> test ->
+# build, plus a committed-secret re-scan (REVIEW-PLAYBOOK.md §4). The Next app
+# lives in web/, so steps run there via `working-directory`.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Node 22 — matches @types/node ^22 and satisfies Next 15 (node >= 20).
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint (skipped if no lint script)
+        run: |
+          if npm run | grep -qE '^\s+lint$'; then
+            npm run lint
+          else
+            echo "No lint script defined — skipping (owned by a separate task)."
+          fi
+
+      - name: Test
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Re-scan committed (tracked) files for obvious secret patterns. Scanning
+      # `git ls-files` (not the working tree) keeps build artifacts / local
+      # .dev.vars out of scope. Patterns follow REVIEW-PLAYBOOK.md §4 but require
+      # a real key-body run after each prefix so doc placeholders like
+      # "sk-ant-..." don't trip the gate.
+      - name: Scan tree for committed secrets
+        run: |
+          set -uo pipefail
+          pattern='sk-ant-[A-Za-z0-9_-]{20}|gh[op]_[A-Za-z0-9]{30}|github_pat_[A-Za-z0-9_]{30}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          if git ls-files | xargs grep -nIE "$pattern" 2>/dev/null; then
+            echo "::error::Possible committed secret(s) found — see matches above."
+            exit 1
+          fi
+          echo "No committed secrets matched."

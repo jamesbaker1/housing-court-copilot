@@ -20,7 +20,8 @@
 import { use, useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 
-import type { Case, ConsentDataCategory } from "@/lib/case";
+import type { Case, ConsentDataCategory, Outcome, OutcomeDisposition } from "@/lib/case";
+import { DISPOSITION_LABEL, type OutcomeSignals } from "@/lib/outcomes";
 
 type LoadState =
   | { phase: "loading" }
@@ -185,6 +186,7 @@ export default function ProviderCaseDetailPage({
 
       {state.phase === "ready" && (
         <ReadyDetail
+          id={id}
           c={state.case}
           summary={state.summary}
           dataCategories={state.dataCategories}
@@ -201,6 +203,7 @@ export default function ProviderCaseDetailPage({
 }
 
 function ReadyDetail({
+  id,
   c,
   summary,
   dataCategories,
@@ -211,6 +214,7 @@ function ReadyDetail({
   actionResult,
   runAction,
 }: {
+  id: string;
   c: Case;
   summary: string;
   dataCategories: ConsentDataCategory[];
@@ -426,6 +430,173 @@ function ReadyDetail({
           <p className="mt-2 rounded bg-white p-2 text-sm text-gray-800">{actionResult}</p>
         )}
       </section>
+
+      {/* Outcome (impact tracking) */}
+      <OutcomeSection id={id} caseStatus={c.status} />
     </div>
+  );
+}
+
+/**
+ * Record the terminal disposition for impact/funder reporting. Fetches the
+ * deterministic SUGGESTIONS (the provider confirms — the engine never auto-sets a
+ * disposition) and the current outcome, then POSTs a provider-recorded outcome.
+ * Disposition is NOT a legal conclusion; it records what happened to the case.
+ */
+function OutcomeSection({ id, caseStatus }: { id: string; caseStatus: Case["status"] }) {
+  const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const [signals, setSignals] = useState<OutcomeSignals | null>(null);
+  const [disposition, setDisposition] = useState<OutcomeDisposition | "">("");
+  const [note, setNote] = useState("");
+  const [consent, setConsent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/provider/cases/${id}/outcome`, { cache: "no-store" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return;
+      const o = (data.outcome as Outcome | null) ?? null;
+      const s = (data.signals as OutcomeSignals | null) ?? null;
+      setOutcome(o);
+      setSignals(s);
+      setConsent(o?.consented_to_report === true);
+      // Default the selector to the existing disposition, else the top suggestion.
+      setDisposition(o?.disposition ?? s?.suggested?.[0] ?? "");
+    } catch {
+      /* non-fatal: outcome recording is optional */
+    }
+  }, [id]);
+
+  // Re-load whenever the case status changes (a triage action can change the
+  // suggested disposition, e.g. once a case becomes represented).
+  useEffect(() => {
+    void load();
+  }, [load, caseStatus]);
+
+  const record = useCallback(async () => {
+    if (!disposition) return;
+    setBusy(true);
+    setResult(null);
+    try {
+      const res = await fetch(`/api/provider/cases/${id}/outcome`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          disposition,
+          note: note.trim() || undefined,
+          consented_to_report: consent,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setResult(`Could not record outcome: ${data?.message ?? res.statusText}`);
+        return;
+      }
+      const o = (data.outcome as Outcome | null) ?? null;
+      setOutcome(o);
+      setNote("");
+      setResult(
+        `Outcome recorded: ${o ? DISPOSITION_LABEL[o.disposition] : disposition}.` +
+          (data.anonymized ? " An anonymized impact row was emitted (tenant consented)." : ""),
+      );
+    } catch {
+      setResult("Network error recording the outcome.");
+    } finally {
+      setBusy(false);
+    }
+  }, [id, disposition, note, consent]);
+
+  const suggested = signals?.suggested ?? [];
+
+  return (
+    <section className="rounded-lg border border-gray-200 bg-white p-4">
+      <h2 className="text-lg font-semibold text-gray-900">Outcome (impact tracking)</h2>
+      <p className="mt-1 text-xs text-gray-500">
+        Records what happened to the case for impact/funder reporting — NOT a legal
+        conclusion or advice. Suggestions are derived from case state; you confirm.
+      </p>
+
+      {outcome && (
+        <p className="mt-2 rounded bg-gray-50 p-2 text-sm text-gray-800">
+          Recorded: <strong>{DISPOSITION_LABEL[outcome.disposition]}</strong>
+          <span className="text-gray-500"> · {outcome.recorded_at}</span>
+          {outcome.consented_to_report ? (
+            <span className="ml-1 text-xs text-green-700">(reported, anonymized)</span>
+          ) : (
+            <span className="ml-1 text-xs text-gray-500">(not reported)</span>
+          )}
+          {outcome.note ? <span className="block text-xs text-gray-600">note: {outcome.note}</span> : null}
+        </p>
+      )}
+
+      <label htmlFor="outcome-disposition" className="mt-3 block text-sm text-gray-700">
+        Disposition
+      </label>
+      <select
+        id="outcome-disposition"
+        value={disposition}
+        onChange={(e) => setDisposition(e.target.value as OutcomeDisposition)}
+        className="mt-1 w-full rounded border border-gray-300 p-2 text-sm"
+      >
+        <option value="" disabled>
+          Select a disposition…
+        </option>
+        {(Object.entries(DISPOSITION_LABEL) as [OutcomeDisposition, string][]).map(
+          ([code, label]) => (
+            <option key={code} value={code}>
+              {label}
+              {suggested.includes(code) ? " (suggested)" : ""}
+            </option>
+          ),
+        )}
+      </select>
+      {suggested.length > 0 && (
+        <p className="mt-1 text-xs text-gray-500">
+          Suggested from case state:{" "}
+          {suggested.map((s) => DISPOSITION_LABEL[s]).join(", ")}.
+        </p>
+      )}
+
+      <label htmlFor="outcome-note" className="mt-3 block text-sm text-gray-700">
+        Note (optional)
+      </label>
+      <textarea
+        id="outcome-note"
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        rows={2}
+        className="mt-1 w-full rounded border border-gray-300 p-2 text-sm"
+        placeholder="Internal note (never furnished to a landlord)"
+      />
+
+      <label className="mt-3 flex items-start gap-2 text-sm text-gray-700">
+        <input
+          type="checkbox"
+          checked={consent}
+          onChange={(e) => setConsent(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Tenant consented to include this outcome (anonymized, no PII) in impact /
+          funder reporting. Leave unchecked to keep it on the case only.
+        </span>
+      </label>
+
+      <div className="mt-3">
+        <button
+          type="button"
+          disabled={busy || !disposition}
+          onClick={() => void record()}
+          className="rounded-md bg-trust-600 px-4 py-2 text-sm font-medium text-white hover:bg-trust-700 disabled:opacity-50"
+        >
+          {outcome ? "Update outcome" : "Record outcome"}
+        </button>
+      </div>
+      {result && (
+        <p className="mt-2 rounded bg-gray-50 p-2 text-sm text-gray-800">{result}</p>
+      )}
+    </section>
   );
 }
