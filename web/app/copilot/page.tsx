@@ -47,6 +47,7 @@ import StipReview from "@/components/StipReview";
 import ResumeByPhone from "@/components/ResumeByPhone";
 import Turnstile from "@/components/Turnstile";
 import RegisterInEtrack from "@/components/RegisterInEtrack";
+import EvidenceUploader from "@/components/EvidenceUploader";
 import { DisclaimerContext, TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
 import { fetchWithTimeout, fetchLlm } from "@/lib/fetch";
 import { downscaleImage } from "@/lib/image";
@@ -1442,6 +1443,18 @@ export default function CopilotPage() {
               </div>
             )}
           </div>
+
+          {/* Upload + attach supporting evidence (R2-backed). Requires a real
+              caseId; when persistence is unavailable (S8) the file can't be
+              owner-scoped, so we hide it rather than drop the blob. */}
+          {caseId && (
+            <EvidenceUploader
+              caseId={caseId}
+              caseObject={caseObject}
+              authHeaders={caseAuthHeaders}
+              onCaseUpdate={setPersistedCase}
+            />
+          )}
 
           <NavButtons
             onBack={() => setStep(3)}

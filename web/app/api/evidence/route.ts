@@ -23,12 +23,16 @@ import { z } from "zod";
 
 import {
   CaseSchema,
+  DocumentTypeSchema,
   EvidenceTypeSchema,
   OpenDataDatasetSchema,
+  StorageRefSchema,
 } from "@/lib/case";
 import {
+  addDocument,
   addEvidence,
   applyTags,
+  buildDocument,
   buildOpenDataAssertion,
   type AddEvidenceInput,
 } from "@/lib/evidence";
@@ -37,6 +41,10 @@ import { limitPublicApi, checkLlmGlobalLimit } from "@/lib/ratelimit";
 
 export const runtime = "nodejs";
 
+function nowIso(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 const RequestSchema = z.object({
   /** The current Case Object the evidence is being added to. */
   case: CaseSchema,
@@ -44,6 +52,16 @@ const RequestSchema = z.object({
   /** Declared/known type; the LLM may refine it when auto_tag is on. */
   evidence_type: EvidenceTypeSchema.optional(),
   document_id: z.string().nullable().optional(),
+  /**
+   * A stored blob (from POST /api/evidence/upload). When present, a Document is
+   * minted around it and the new evidence item is linked to it via document_id.
+   * Only meaningful for tenant_uploaded items.
+   */
+  storage_ref: StorageRefSchema.optional(),
+  /** Declared document type for the minted Document (defaults to "other"). */
+  document_type: DocumentTypeSchema.optional(),
+  /** Optional transcribed text to keep on the Document for provider review. */
+  ocr_text: z.string().max(50_000).nullable().optional(),
   /** Free text used for LLM tagging (OCR text or tenant description). */
   content: z.string().optional(),
   /** Run Surface 6 tagging over `content`. Defaults false. */
@@ -109,15 +127,32 @@ export async function POST(req: Request): Promise<NextResponse> {
         })
       : null;
 
+  // If the caller passed a stored blob, mint a Document around it FIRST so the
+  // evidence item can link to it. The blob itself lives in R2 (put by
+  // /api/evidence/upload); here we only record its content-addressed reference.
+  let workingCase = input.case;
+  let documentId = input.document_id ?? null;
+  if (input.storage_ref) {
+    const doc = buildDocument({
+      storage_ref: input.storage_ref,
+      document_type: input.document_type,
+      ocr_text: input.ocr_text ?? null,
+      uploaded_by: { actor_type: "tenant" },
+      now: nowIso(),
+    });
+    workingCase = addDocument(workingCase, doc);
+    documentId = doc.document_id;
+  }
+
   const addInput: AddEvidenceInput = {
     // evidence_type may be refined by tagging below; default to a hint or "other".
     evidence_type: input.evidence_type ?? "other",
     origin: input.origin,
-    document_id: input.document_id ?? null,
+    document_id: documentId,
     open_data: openDataAssertion,
   };
 
-  const { case: updatedCase, item } = addEvidence(input.case, addInput);
+  const { case: updatedCase, item } = addEvidence(workingCase, addInput);
 
   // Optional LLM tagging pass over the provided content.
   let tagging_failed = false;

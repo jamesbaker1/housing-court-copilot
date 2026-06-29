@@ -17,14 +17,19 @@
  */
 
 import {
+  DocumentSchema,
   EvidenceItemSchema,
   OpenDataAssertionSchema,
+  type Actor,
   type Case,
   type DefenseCode,
+  type Document,
+  type DocumentType,
   type EvidenceItem,
   type EvidenceType,
   type OpenDataAssertion,
   type OpenDataDataset,
+  type StorageRef,
 } from "@/lib/case";
 
 import { newId } from "@/lib/ids";
@@ -131,6 +136,46 @@ export function addEvidence(c: Case, input: AddEvidenceInput): {
     case: { ...c, evidence: [...c.evidence, item] },
     item,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Documents (the blob a tenant_uploaded evidence item links to)
+// ---------------------------------------------------------------------------
+
+export interface BuildDocumentInput {
+  /** Content-addressed R2 reference returned by POST /api/evidence/upload. */
+  storage_ref: StorageRef;
+  /** Declared/known document type; defaults to "other". */
+  document_type?: DocumentType;
+  /** Optional transcribed text (from vision intake), kept for provider review. */
+  ocr_text?: string | null;
+  /** Who uploaded it; defaults to the tenant. Never the LLM. */
+  uploaded_by?: Actor;
+  /** ISO timestamp (caller-provided so this stays pure / deterministic). */
+  now: string;
+}
+
+/**
+ * Construct a validated {@link Document} (mints the `doc_` id deterministically)
+ * around a stored blob's {@link StorageRef}. This is how an uploaded blob becomes
+ * a first-class, linkable record on the Case — a tenant_uploaded evidence item
+ * points at it via `document_id`.
+ */
+export function buildDocument(input: BuildDocumentInput): Document {
+  const doc: Document = {
+    document_id: newId("doc"),
+    document_type: input.document_type ?? "other",
+    storage_ref: input.storage_ref,
+    ocr_text: input.ocr_text ?? null,
+    uploaded_at: input.now,
+    uploaded_by: input.uploaded_by ?? { actor_type: "tenant" },
+  };
+  return DocumentSchema.parse(doc);
+}
+
+/** Return a new Case with the document appended. Does not mutate `c`. */
+export function addDocument(c: Case, doc: Document): Case {
+  return { ...c, documents: [...c.documents, doc] };
 }
 
 // ---------------------------------------------------------------------------
