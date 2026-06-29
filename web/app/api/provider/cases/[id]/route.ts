@@ -42,7 +42,7 @@ import {
 } from "@/lib/provider-redaction";
 import {
   readProviderPrincipal,
-  consentVisibleToPrv,
+  visibleHandoffConsent,
   attorneyAdvanceAllowed,
   type ProviderPrincipal,
 } from "@/lib/auth/provider-principal";
@@ -63,18 +63,7 @@ function grantedHandoffConsent(
   asOf: string,
   prv: string | null,
 ): Consent | null {
-  const now = Date.parse(asOf);
-  return (
-    (c.consents ?? []).find(
-      (cn) =>
-        cn.scope === "handoff_to_provider" &&
-        cn.recipient.recipient_type === "legal_aid_provider" &&
-        cn.granted &&
-        !(cn.revoked_at && Date.parse(cn.revoked_at) <= now) &&
-        !(cn.expires_at && Date.parse(cn.expires_at) <= now) &&
-        consentVisibleToPrv(cn, prv),
-    ) ?? null
-  );
+  return visibleHandoffConsent(c, prv, asOf);
 }
 
 export async function GET(

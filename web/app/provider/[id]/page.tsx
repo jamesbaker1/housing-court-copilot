@@ -236,6 +236,28 @@ function ReadyDetail({
   ].filter(Boolean) as string[];
 
   const packetReady = ["prepared", "referred", "represented"].includes(c.status);
+
+  // Owner-only blob view: fetch WITH the Access cookie (same-origin) and open via
+  // a transient object URL — never a public URL. Gated server-side on a consent
+  // that shares the "documents" category.
+  const [viewingHash, setViewingHash] = useState<string | null>(null);
+  async function viewFile(hash: string) {
+    setViewingHash(hash);
+    try {
+      const res = await fetch(`/api/provider/cases/${id}/blob?hash=${hash}`, {
+        cache: "no-store",
+      });
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank", "noopener,noreferrer");
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    } catch {
+      /* non-fatal */
+    } finally {
+      setViewingHash(null);
+    }
+  }
   // The attorney advance (referred → represented) is the only gated transition.
   const canTakeAsAttorney = c.status === "referred";
 
@@ -313,6 +335,10 @@ function ReadyDetail({
             {c.evidence.map((e) => {
               const verifyState = e.open_data?.verify_before_file.state ?? null;
               const blocked = e.origin === "open_data" && verifyState !== "verified";
+              const doc = e.document_id
+                ? c.documents.find((d) => d.document_id === e.document_id)
+                : undefined;
+              const hash = doc?.storage_ref.content_hash_sha256 ?? null;
               return (
                 <li key={e.evidence_id} className="rounded border border-gray-100 p-2 text-sm">
                   <div className="flex flex-wrap items-center gap-2">
@@ -330,6 +356,16 @@ function ReadyDetail({
                       >
                         verify: {verifyState}
                       </span>
+                    )}
+                    {hash && (
+                      <button
+                        type="button"
+                        disabled={viewingHash === hash}
+                        onClick={() => void viewFile(hash)}
+                        className="text-xs font-medium text-trust-700 underline underline-offset-2 disabled:opacity-50"
+                      >
+                        {viewingHash === hash ? "Opening…" : "View file"}
+                      </button>
                     )}
                   </div>
                   {e.summary && <p className="mt-1 text-gray-700">{e.summary}</p>}

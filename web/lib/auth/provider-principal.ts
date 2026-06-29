@@ -70,24 +70,41 @@ export function consentVisibleToPrv(cn: Consent, prv: string | null): boolean {
 }
 
 /**
+ * The granted, live handoff_to_provider consent VISIBLE to the given provider org
+ * id (prv), or null. Combines the consent-validity check (granted, not revoked,
+ * not expired) with per-provider scoping. `prv = null` ⇒ no scoping (any valid
+ * consent matches). Returning the Consent lets callers read its data_categories
+ * (e.g. to gate a documents download on the "documents" category being shared).
+ */
+export function visibleHandoffConsent(
+  c: Case,
+  prv: string | null,
+  asOf: string = new Date().toISOString(),
+): Consent | null {
+  const now = Date.parse(asOf);
+  return (
+    (c.consents ?? []).find((cn) => {
+      if (cn.scope !== "handoff_to_provider") return false;
+      if (cn.recipient.recipient_type !== "legal_aid_provider") return false;
+      if (!cn.granted) return false;
+      if (cn.revoked_at && Date.parse(cn.revoked_at) <= now) return false;
+      if (cn.expires_at && Date.parse(cn.expires_at) <= now) return false;
+      return consentVisibleToPrv(cn, prv);
+    }) ?? null
+  );
+}
+
+/**
  * Whether a Case carries a granted, live handoff_to_provider consent VISIBLE to
- * the given provider org id (prv). Combines the consent-validity check with
- * per-provider scoping. `prv = null` ⇒ no scoping (visible if any valid consent).
+ * the given provider org id (prv). Boolean convenience over
+ * {@link visibleHandoffConsent}.
  */
 export function hasVisibleHandoffConsent(
   c: Case,
   prv: string | null,
   asOf: string = new Date().toISOString(),
 ): boolean {
-  const now = Date.parse(asOf);
-  return (c.consents ?? []).some((cn) => {
-    if (cn.scope !== "handoff_to_provider") return false;
-    if (cn.recipient.recipient_type !== "legal_aid_provider") return false;
-    if (!cn.granted) return false;
-    if (cn.revoked_at && Date.parse(cn.revoked_at) <= now) return false;
-    if (cn.expires_at && Date.parse(cn.expires_at) <= now) return false;
-    return consentVisibleToPrv(cn, prv);
-  });
+  return visibleHandoffConsent(c, prv, asOf) != null;
 }
 
 /**

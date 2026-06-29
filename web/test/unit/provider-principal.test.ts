@@ -12,6 +12,7 @@ import {
   readProviderPrincipal,
   consentVisibleToPrv,
   hasVisibleHandoffConsent,
+  visibleHandoffConsent,
   attorneyAdvanceAllowed,
   hasAttorneyRole,
   ATTORNEY_ROLE,
@@ -78,6 +79,22 @@ describe("consentVisibleToPrv / hasVisibleHandoffConsent — per-provider scopin
   it("a revoked/expired consent is never visible regardless of prv", () => {
     const revoked = { ...handoffConsent({ recipientId: "prv_me" }), revoked_at: "2020-01-01T00:00:00Z" } as Consent;
     expect(hasVisibleHandoffConsent(makeCase({ consents: [revoked] }), "prv_me")).toBe(false);
+  });
+});
+
+describe("visibleHandoffConsent — returns the consent for category gating", () => {
+  it("returns the matching consent so callers can read data_categories", () => {
+    const cn = handoffConsent({ recipientId: "prv_me" });
+    const c = makeCase({ consents: [cn] });
+    const got = visibleHandoffConsent(c, "prv_me");
+    expect(got?.consent_id).toBe(cn.consent_id);
+    // The documents-download gate reads this: case_facts is shared, documents is not.
+    expect(got?.data_categories.includes("case_facts")).toBe(true);
+    expect(got?.data_categories.includes("documents")).toBe(false);
+  });
+  it("returns null when the only consent is addressed to a different prv", () => {
+    const c = makeCase({ consents: [handoffConsent({ recipientId: "prv_other" })] });
+    expect(visibleHandoffConsent(c, "prv_me")).toBeNull();
   });
 });
 
