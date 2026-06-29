@@ -332,6 +332,9 @@ export const ConsentRecipientTypeSchema = z.enum([
   "benefits_agency",
   "reminder_service",
   "attorney",
+  // First-party: data stored by THIS service for the tenant (e.g. opting in to
+  // store household income/size for eligibility). Not a third-party share.
+  "service",
 ]);
 
 export const ConsentDataCategorySchema = z.enum([

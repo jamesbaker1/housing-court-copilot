@@ -15,16 +15,30 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
+import type { Case, Consent, SensitiveData } from "@/lib/case";
 import { getCase, patchCase } from "@/lib/store";
 import { evaluateEligibility } from "@/lib/eligibility";
 import { limitPublicApi } from "@/lib/ratelimit";
 import { authorizeCaseAccess, readAccessContext } from "@/lib/auth/session";
+import { newId } from "@/lib/ids";
 
 export const runtime = "nodejs";
 
+/** Versioned text the tenant agreed to when opting in to store income/size. */
+const STORE_SENSITIVE_CONSENT_TEXT_VERSION = "store-sensitive-v1";
+
 const BodySchema = z.object({
   case_id: z.string().regex(/^case_[0-9a-hjkmnp-tv-z]{26}$/),
+  /** Annual household income in CENTS (opt-in, stored only with consent). */
+  household_income_cents: z.number().int().min(0).optional(),
+  household_size: z.number().int().min(1).optional(),
+  /** Affirmative opt-in to STORE the household income/size for screening. */
+  consent_to_store: z.boolean().optional(),
 });
+
+function nowIso(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
 
 export async function POST(req: Request): Promise<NextResponse> {
   // Rate limit (cost protection).
@@ -54,7 +68,7 @@ export async function POST(req: Request): Promise<NextResponse> {
       { status: 400 },
     );
   }
-  const { case_id } = parsed.data;
+  const { case_id, household_income_cents, household_size, consent_to_store } = parsed.data;
 
   // OWNERSHIP GATE: writing eligibility is a write to the case.
   const authz = await authorizeCaseAccess(case_id, readAccessContext(req));
@@ -73,14 +87,55 @@ export async function POST(req: Request): Promise<NextResponse> {
     );
   }
 
-  // Deterministic evaluation (no LLM). `evaluated_at` is stamped by the server.
-  const eligibility = evaluateEligibility(existing, {
-    now: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
-  });
+  // If the tenant supplied household income/size, persist them — but ONLY with an
+  // affirmative store_sensitive_data consent (default-deny). The sensitive write
+  // and the consent record are made together here, server-side, so income is
+  // never stored without the recorded opt-in.
+  const at = nowIso();
+  const providingSensitive =
+    household_income_cents !== undefined || household_size !== undefined;
+  let candidate: Case = existing;
+  const patch: Partial<Case> = {};
+
+  if (providingSensitive) {
+    if (consent_to_store !== true) {
+      return NextResponse.json(
+        {
+          error: "consent_required",
+          message:
+            "Storing household income/size requires consent_to_store: true.",
+        },
+        { status: 403 },
+      );
+    }
+    const sensitive: SensitiveData = {
+      ...(existing.sensitive ?? {}),
+      ...(household_income_cents !== undefined ? { household_income_cents } : {}),
+      ...(household_size !== undefined ? { household_size } : {}),
+    };
+    const consent: Consent = {
+      consent_id: newId("cns"),
+      scope: "store_sensitive_data",
+      // First-party storage by this service — not a third-party share.
+      recipient: { recipient_type: "service" },
+      granted: true,
+      granted_at: at,
+      consent_text_version: STORE_SENSITIVE_CONSENT_TEXT_VERSION,
+      data_categories: ["eligibility"],
+      method: "pwa_checkbox",
+    };
+    candidate = { ...existing, sensitive };
+    patch.sensitive = sensitive;
+    patch.consents = [...existing.consents, consent];
+  }
+
+  // Deterministic evaluation (no LLM) on the candidate (post-sensitive-write).
+  // `evaluated_at` is stamped by the server.
+  patch.eligibility = evaluateEligibility(candidate, { now: at });
 
   let updated;
   try {
-    updated = await patchCase(case_id, { eligibility });
+    updated = await patchCase(case_id, patch);
   } catch (err) {
     return NextResponse.json(
       {
@@ -97,5 +152,8 @@ export async function POST(req: Request): Promise<NextResponse> {
     );
   }
 
-  return NextResponse.json({ case_id, eligibility: updated.eligibility }, { status: 200 });
+  return NextResponse.json(
+    { case_id, eligibility: updated.eligibility, case: updated },
+    { status: 200 },
+  );
 }

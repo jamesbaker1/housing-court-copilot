@@ -48,6 +48,7 @@ import ResumeByPhone from "@/components/ResumeByPhone";
 import Turnstile from "@/components/Turnstile";
 import RegisterInEtrack from "@/components/RegisterInEtrack";
 import EvidenceUploader from "@/components/EvidenceUploader";
+import EligibilityScreener from "@/components/EligibilityScreener";
 import { DisclaimerContext, TALK_TO_A_PERSON_CTA } from "@/lib/disclaimers";
 import { fetchWithTimeout, fetchLlm } from "@/lib/fetch";
 import { downscaleImage } from "@/lib/image";
@@ -1449,6 +1450,16 @@ export default function CopilotPage() {
               owner-scoped, so we hide it rather than drop the blob. */}
           {caseId && (
             <EvidenceUploader
+              caseId={caseId}
+              caseObject={caseObject}
+              authHeaders={caseAuthHeaders}
+              onCaseUpdate={setPersistedCase}
+            />
+          )}
+
+          {/* Eligibility screener (deterministic; consent-gated sensitive input). */}
+          {caseId && (
+            <EligibilityScreener
               caseId={caseId}
               caseObject={caseObject}
               authHeaders={caseAuthHeaders}
