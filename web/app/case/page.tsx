@@ -38,6 +38,12 @@ import {
   eligibilitySummary,
 } from "@/lib/eligibility-display";
 import {
+  buildCourtPrepChecklist,
+  groupPrepItems,
+  PREP_CATEGORY_LABEL,
+  type PrepCategory,
+} from "@/lib/court-prep";
+import {
   type Language,
   DEFAULT_LANGUAGE,
   SUPPORTED_LANGUAGES,
@@ -253,6 +259,8 @@ export default function CaseHomePage() {
 
   const scheduledReminders = reminders.filter((r) => r.state === "scheduled");
   const eligibilityRows = tenantEligibilityRows(c.eligibility);
+  const prep = buildCourtPrepChecklist(c);
+  const prepGroups = groupPrepItems(prep.items);
 
   // The single NEXT recommended action — a simple, honest priority ladder that
   // never advises on the merits, only on what to do next in the tool.
@@ -488,6 +496,42 @@ export default function CaseHomePage() {
               the official court system. Until then, rely on your court notice.
             </p>
           )}
+        </HubSection>
+
+        <HubSection
+          icon="📋"
+          title="Get ready for court"
+          href="/case"
+          summary={
+            prep.hasCourtDate
+              ? "Your court-day checklist: what to bring and what to expect"
+              : "Confirm your court date, then see your court-day checklist"
+          }
+        >
+          <div className="mt-2 space-y-3">
+            {(["bring", "timing", "expect", "protect"] as PrepCategory[]).map(
+              (cat) =>
+                prepGroups[cat].length > 0 && (
+                  <div key={cat}>
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-trust-600">
+                      {PREP_CATEGORY_LABEL[cat]}
+                    </h4>
+                    <ul className="mt-1 space-y-1">
+                      {prepGroups[cat].map((item) => (
+                        <li key={item.id} className="text-sm text-trust-800">
+                          <span aria-hidden="true">☐ </span>
+                          {item.text}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ),
+            )}
+            <p className="text-xs text-trust-600">
+              This is practical court-day information, not legal advice. For
+              questions about your case, talk to a free lawyer.
+            </p>
+          </div>
         </HubSection>
 
         <HubSection
